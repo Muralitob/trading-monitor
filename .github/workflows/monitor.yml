@@ -1,0 +1,23 @@
+name: Price Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # 每 5 分钟触发
+  workflow_dispatch:        # 允许在网页上手动触发（用来测试）
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run monitor
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+        run: python monitor.py
