@@ -33,6 +33,9 @@ VOL_THRESHOLD = 0.03  # 4H 振幅阈值
 
 CHANNEL_SYMBOLS = ["SOXLUSDT", "HYPEUSDT", "MUUSDT"]  # 跑通道识别
 
+# EMA 监控品种
+EMA_SYMBOLS = ["HYPEUSDT", "MUUSDT", "SOXLUSDT", "BTCUSDT", "ETHUSDT"]
+
 
 # ==================== 工具函数 ====================
 
@@ -212,6 +215,118 @@ def check_channel(symbol):
     return None
 
 
+# ==================== EMA 检测 ====================
+
+def ema_series(values, period):
+    """返回完整 EMA 序列（长度和输入一致）"""
+    if not values:
+        return []
+    k = 2 / (period + 1)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+
+def _bar_just_closed(kline, now_ts, tolerance_sec=360):
+    """判断 K线是否刚收盘（用于 4H / 1D 触发窗口）"""
+    close_ts = kline[6] / 1000
+    age = now_ts - close_ts
+    return 0 <= age < tolerance_sec
+
+
+def check_ema_signals(symbol, now_utc):
+    """
+    检查 EMA 相关信号：
+      A. 4H 收盘触碰 EMA25 (0.5% 容差)
+      B. 4H 收盘触碰 EMA100 (0.8% 容差)
+      C. 日线收盘穿越 EMA50
+    返回 alert list（每项是 dict）
+    """
+    now_ts = now_utc.timestamp()
+    alerts = []
+
+    # ==== 4H EMA25 / EMA100 触碰 ====
+    try:
+        k4h = klines(symbol, "4h", 150)
+        if len(k4h) >= 105:
+            closes = [float(k[4]) for k in k4h]
+            ema25 = ema_series(closes, 25)
+            ema100 = ema_series(closes, 100)
+
+            # 刚收盘的 4H K 线（倒数第 2 根）
+            last_closed = k4h[-2]
+            if _bar_just_closed(last_closed, now_ts):
+                close_p = closes[-2]
+                prev_close = closes[-3]  # 上一根 4H 收盘
+
+                # A. EMA25 触碰
+                e25 = ema25[-2]
+                e25_prev = ema25[-3]
+                tol25 = e25 * 0.005
+                # 触碰 = 本次 K线收盘距 EMA25 ≤ 0.5%，上一根 > 0.5%
+                if abs(close_p - e25) <= tol25 and abs(prev_close - e25_prev) > tol25:
+                    side = "上方" if close_p > e25 else "下方"
+                    alerts.append({
+                        "kind": "ema_touch",
+                        "symbol": symbol,
+                        "text": f"4H 收盘 {side}触碰 EMA25",
+                        "detail": f"现价 ${close_p:.4f}  EMA25 ${e25:.4f}",
+                        "icon": "📊",
+                    })
+
+                # B. EMA100 触碰
+                e100 = ema100[-2]
+                e100_prev = ema100[-3]
+                tol100 = e100 * 0.008
+                if abs(close_p - e100) <= tol100 and abs(prev_close - e100_prev) > tol100:
+                    side = "上方" if close_p > e100 else "下方"
+                    alerts.append({
+                        "kind": "ema_touch",
+                        "symbol": symbol,
+                        "text": f"🌟 4H 收盘 {side}触碰 EMA100（大级别支撑）",
+                        "detail": f"现价 ${close_p:.4f}  EMA100 ${e100:.4f}",
+                        "icon": "📊",
+                    })
+    except Exception as e:
+        print(f"[ema_4h:{symbol}] error: {e}")
+
+    # ==== 日线 EMA50 穿越 ====
+    try:
+        k1d = klines(symbol, "1d", 100)
+        if len(k1d) >= 55:
+            closes_d = [float(k[4]) for k in k1d]
+            ema50_d = ema_series(closes_d, 50)
+
+            last_closed_d = k1d[-2]
+            if _bar_just_closed(last_closed_d, now_ts):
+                close_d = closes_d[-2]
+                prev_close_d = closes_d[-3]
+                e50 = ema50_d[-2]
+                e50_prev = ema50_d[-3]
+
+                if prev_close_d < e50_prev and close_d >= e50:
+                    alerts.append({
+                        "kind": "ema_cross",
+                        "symbol": symbol,
+                        "text": "🌟🌟 日线收盘上穿 EMA50（大趋势转多）",
+                        "detail": f"收盘 ${close_d:.4f}  EMA50 ${e50:.4f}",
+                        "icon": "🚀",
+                    })
+                elif prev_close_d > e50_prev and close_d <= e50:
+                    alerts.append({
+                        "kind": "ema_cross",
+                        "symbol": symbol,
+                        "text": "🌟🌟 日线收盘下穿 EMA50（大趋势转空）",
+                        "detail": f"收盘 ${close_d:.4f}  EMA50 ${e50:.4f}",
+                        "icon": "⚠️",
+                    })
+    except Exception as e:
+        print(f"[ema_1d:{symbol}] error: {e}")
+
+    return alerts
+
+
 # ==================== 主流程 ====================
 
 def main():
@@ -267,7 +382,12 @@ def main():
         except Exception as e:
             print(f"[channel:{symbol}] error: {e}")
 
-    if not alerts and not channel_alerts:
+    # 4. EMA 触碰 / 穿越
+    ema_alerts = []
+    for symbol in EMA_SYMBOLS:
+        ema_alerts.extend(check_ema_signals(symbol, now_utc))
+
+    if not alerts and not channel_alerts and not ema_alerts:
         print("No alerts triggered")
         return
 
@@ -286,9 +406,13 @@ def main():
         lines.append(f"  触点 {ch['touch_upper']}/{ch['touch_lower']}  R² {ch['r2_upper']:.2f}/{ch['r2_lower']:.2f}")
         lines.append(f"  {ca['signal']}")
         lines.append("")
+    for ea in ema_alerts:
+        lines.append(f"{ea['icon']} *{ea['symbol']}*  {ea['text']}")
+        lines.append(f"  {ea['detail']}")
+        lines.append("")
     lines.append(f"_{now_utc.strftime('%m-%d %H:%M')} UTC · 仅监控提醒，不自动下单_")
     send_tg("\n".join(lines))
-    print(f"Sent: {len(alerts)} level/vol + {len(channel_alerts)} channel alerts")
+    print(f"Sent: {len(alerts)} level/vol + {len(channel_alerts)} channel + {len(ema_alerts)} ema alerts")
 
 
 if __name__ == "__main__":
