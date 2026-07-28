@@ -28,13 +28,22 @@ RULES = {
     ],
 }
 
-VOLATILITY_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
-VOL_THRESHOLD = 0.03  # 4H 振幅阈值
+# 所有关注的品种
+ALL_SYMBOLS = [
+    "BTCUSDT", "ETHUSDT",              # 加密大盘
+    "HYPEUSDT",                        # 加密山寨
+    "XAUUSDT",                         # 黄金
+    "SOXLUSDT", "KORUUSDT",            # 3x ETF
+    "EWYUSDT",                         # 韩国 ETF
+    "SKHYNIXUSDT", "SNDKUSDT",         # 半导体
+    "MUUSDT",                          # 美光
+]
 
-CHANNEL_SYMBOLS = ["SOXLUSDT", "HYPEUSDT", "MUUSDT"]  # 跑通道识别
+VOLATILITY_SYMBOLS = ["BTCUSDT", "ETHUSDT", "XAUUSDT"]
+VOL_THRESHOLD = 0.03
 
-# EMA 监控品种
-EMA_SYMBOLS = ["HYPEUSDT", "MUUSDT", "SOXLUSDT", "BTCUSDT", "ETHUSDT"]
+CHANNEL_SYMBOLS = ALL_SYMBOLS  # 通道识别应用到全部
+EMA_SYMBOLS = ALL_SYMBOLS       # EMA 检测应用到全部
 
 
 # ==================== 工具函数 ====================
@@ -215,6 +224,74 @@ def check_channel(symbol):
     return None
 
 
+# ==================== 反抽检测（Break & Retest） ====================
+
+def check_retest(symbol, rules, lookback_hours=24):
+    """
+    检测破位后反抽到关键位：
+      - 24 小时内 1H 收盘破位
+      - 现在 5m 收盘从破位反方向回到关键位附近
+    """
+    try:
+        k1h = klines(symbol, "1h", lookback_hours + 2)
+        k5m = klines(symbol, "5m", 3)
+    except Exception as e:
+        print(f"[retest:{symbol}] fetch error: {e}")
+        return []
+    if len(k1h) < 3 or len(k5m) < 3:
+        return []
+
+    prev_prev_5m = float(k5m[-3][4])
+    prev_5m = float(k5m[-2][4])
+    current = float(k5m[-1][4])
+
+    alerts = []
+    for r in rules:
+        level = r["level"]
+        tol = level * 0.005  # 0.5% 容差判定"接近"
+
+        # 查找 24h 内 1H K线是否有破位（收盘穿越）
+        broke_down = False  # 从上方破到下方
+        broke_up = False    # 从下方破到上方
+        break_time = None
+
+        for i in range(len(k1h) - 1):  # 不含最后一根（当前未收盘）
+            o = float(k1h[i][1])
+            c = float(k1h[i][4])
+            if o > level and c < level - tol:
+                broke_down = True
+                break_time = k1h[i][6] / 1000
+            elif o < level and c > level + tol:
+                broke_up = True
+                break_time = k1h[i][6] / 1000
+
+        # 破位后反抽做空（做空关注）
+        if broke_down and prev_prev_5m < level - tol and \
+           (level - tol) <= prev_5m <= (level + tol):
+            alerts.append({
+                "symbol": symbol,
+                "level": level,
+                "type": "反抽阻力",
+                "text": f"跌破 ${level:g} 后反抽 → **做空关注**",
+                "price": current,
+                "icon": "🔻",
+            })
+
+        # 突破后回踩做多（做多关注）
+        if broke_up and prev_prev_5m > level + tol and \
+           (level - tol) <= prev_5m <= (level + tol):
+            alerts.append({
+                "symbol": symbol,
+                "level": level,
+                "type": "回踩支撑",
+                "text": f"突破 ${level:g} 后回踩 → **做多关注**",
+                "price": current,
+                "icon": "🔺",
+            })
+
+    return alerts
+
+
 # ==================== EMA 检测 ====================
 
 def ema_series(values, period):
@@ -387,7 +464,12 @@ def main():
     for symbol in EMA_SYMBOLS:
         ema_alerts.extend(check_ema_signals(symbol, now_utc))
 
-    if not alerts and not channel_alerts and not ema_alerts:
+    # 5. 破位反抽（对所有配了关键位的品种）
+    retest_alerts = []
+    for symbol, rules in RULES.items():
+        retest_alerts.extend(check_retest(symbol, rules))
+
+    if not alerts and not channel_alerts and not ema_alerts and not retest_alerts:
         print("No alerts triggered")
         return
 
@@ -410,9 +492,13 @@ def main():
         lines.append(f"{ea['icon']} *{ea['symbol']}*  {ea['text']}")
         lines.append(f"  {ea['detail']}")
         lines.append("")
+    for ra in retest_alerts:
+        lines.append(f"{ra['icon']} *{ra['symbol']}*  {ra['text']}")
+        lines.append(f"  现价 `${ra['price']}`  关键位 `${ra['level']:g}`")
+        lines.append("")
     lines.append(f"_{now_utc.strftime('%m-%d %H:%M')} UTC · 仅监控提醒，不自动下单_")
     send_tg("\n".join(lines))
-    print(f"Sent: {len(alerts)} level/vol + {len(channel_alerts)} channel + {len(ema_alerts)} ema alerts")
+    print(f"Sent: {len(alerts)} level/vol + {len(channel_alerts)} channel + {len(ema_alerts)} ema + {len(retest_alerts)} retest alerts")
 
 
 if __name__ == "__main__":
