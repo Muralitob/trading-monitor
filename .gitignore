@@ -4,3 +4,4 @@ __pycache__/
 .DS_Store
 workers/.wrangler/
 workers/node_modules/
+state.json

@@ -1,42 +1,19 @@
-name: Price Monitor
+name: Price Monitor (DISABLED - VPS is authoritative)
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch:
-
-# 避免多个 run 并发导致状态文件冲突
-concurrency:
-  group: monitor
-  cancel-in-progress: false
+  workflow_dispatch:  # 仅手动触发（备用）
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 4
-    permissions:
-      contents: write   # 允许 commit state.json 回仓库
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Run monitor
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
         run: python monitor.py
-
-      - name: Persist state
-        run: |
-          if [ -f state.json ]; then
-            git config user.name "monitor-bot"
-            git config user.email "bot@monitor.local"
-            git add state.json
-            if ! git diff --cached --quiet; then
-              git commit -m "state update [skip ci]"
-              git push
-            fi
-          fi

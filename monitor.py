@@ -220,37 +220,49 @@ def detect_channel(k2h):
     return best[1] if best else None
 
 
-def check_channel(symbol):
-    """检查 symbol 是否触碰通道边界，返回 alert dict 或 None"""
+def check_channel(symbol, state, dk):
+    """检查 symbol 是否触碰通道边界，返回 alert dict 或 None（带状态去重）"""
     k2h = klines(symbol, "2h", 200)
     ch = detect_channel(k2h)
     if not ch:
         return None
 
-    k5m = klines(symbol, "5m", 3)
-    prev_prev_close = float(k5m[-3][4])
-    prev_close = float(k5m[-2][4])
+    k5m = klines(symbol, "5m", 8)  # 滑动窗口
     current = float(k5m[-1][4])
 
     upper = ch["upper"]
     lower = ch["lower"]
-    tol = (upper - lower) * 0.05  # 5% 通道宽度作为触碰容差
+    tol = (upper - lower) * 0.05
 
-    # 触碰下沿：本次收盘触到但没跌穿，且上一根还没触到
-    if lower - tol <= prev_close <= lower + tol and prev_prev_close > lower + tol:
-        sig = "做多关注" if ch["direction"] == "上升通道" else "反弹关注（**逆势，谨慎**）"
-        return {
-            "symbol": symbol, "type": "触碰下沿", "channel": ch,
-            "price": current, "signal": sig,
-        }
+    # 遍历相邻收盘对
+    for i in range(1, len(k5m) - 1):
+        prev_c = float(k5m[i-1][4])
+        curr_c = float(k5m[i][4])
+
+        # 触碰下沿
+        if lower - tol <= curr_c <= lower + tol and prev_c > lower + tol:
+            key = f"channel_lower:{symbol}:{dk}"
+            if not already_fired(state, key):
+                mark_fired(state, key)
+                sig = "做多关注" if ch["direction"] == "上升通道" else "反弹关注（**逆势，谨慎**）"
+                return {
+                    "symbol": symbol, "type": "触碰下沿", "channel": ch,
+                    "price": current, "signal": sig,
+                }
 
     # 触碰上沿
-    if upper - tol <= prev_close <= upper + tol and prev_prev_close < upper - tol:
-        sig = "做空关注" if ch["direction"] == "下降通道" else "回落关注（**逆势，谨慎**）"
-        return {
-            "symbol": symbol, "type": "触碰上沿", "channel": ch,
-            "price": current, "signal": sig,
-        }
+    for i in range(1, len(k5m) - 1):
+        prev_c = float(k5m[i-1][4])
+        curr_c = float(k5m[i][4])
+        if upper - tol <= curr_c <= upper + tol and prev_c < upper - tol:
+            key = f"channel_upper:{symbol}:{dk}"
+            if not already_fired(state, key):
+                mark_fired(state, key)
+                sig = "做空关注" if ch["direction"] == "下降通道" else "回落关注（**逆势，谨慎**）"
+                return {
+                    "symbol": symbol, "type": "触碰上沿", "channel": ch,
+                    "price": current, "signal": sig,
+                }
 
     return None
 
@@ -340,7 +352,7 @@ def _bar_just_closed(kline, now_ts, tolerance_sec=360):
     return 0 <= age < tolerance_sec
 
 
-def check_ema_signals(symbol, now_utc):
+def check_ema_signals(symbol, now_utc, state, dk):
     """
     检查 EMA 相关信号：
       A. 4H 收盘触碰 EMA25 (0.5% 容差)
@@ -371,28 +383,34 @@ def check_ema_signals(symbol, now_utc):
                 tol25 = e25 * 0.005
                 # 触碰 = 本次 K线收盘距 EMA25 ≤ 0.5%，上一根 > 0.5%
                 if abs(close_p - e25) <= tol25 and abs(prev_close - e25_prev) > tol25:
-                    side = "上方" if close_p > e25 else "下方"
-                    alerts.append({
-                        "kind": "ema_touch",
-                        "symbol": symbol,
-                        "text": f"4H 收盘 {side}触碰 EMA25",
-                        "detail": f"现价 ${close_p:.4f}  EMA25 ${e25:.4f}",
-                        "icon": "📊",
-                    })
+                    key = f"ema25:{symbol}:{dk}"
+                    if not already_fired(state, key):
+                        mark_fired(state, key)
+                        side = "上方" if close_p > e25 else "下方"
+                        alerts.append({
+                            "kind": "ema_touch",
+                            "symbol": symbol,
+                            "text": f"4H 收盘 {side}触碰 EMA25",
+                            "detail": f"现价 ${close_p:.4f}  EMA25 ${e25:.4f}",
+                            "icon": "📊",
+                        })
 
                 # B. EMA100 触碰
                 e100 = ema100[-2]
                 e100_prev = ema100[-3]
                 tol100 = e100 * 0.008
                 if abs(close_p - e100) <= tol100 and abs(prev_close - e100_prev) > tol100:
-                    side = "上方" if close_p > e100 else "下方"
-                    alerts.append({
-                        "kind": "ema_touch",
-                        "symbol": symbol,
-                        "text": f"🌟 4H 收盘 {side}触碰 EMA100（大级别支撑）",
-                        "detail": f"现价 ${close_p:.4f}  EMA100 ${e100:.4f}",
-                        "icon": "📊",
-                    })
+                    key = f"ema100:{symbol}:{dk}"
+                    if not already_fired(state, key):
+                        mark_fired(state, key)
+                        side = "上方" if close_p > e100 else "下方"
+                        alerts.append({
+                            "kind": "ema_touch",
+                            "symbol": symbol,
+                            "text": f"🌟 4H 收盘 {side}触碰 EMA100（大级别支撑）",
+                            "detail": f"现价 ${close_p:.4f}  EMA100 ${e100:.4f}",
+                            "icon": "📊",
+                        })
     except Exception as e:
         print(f"[ema_4h:{symbol}] error: {e}")
 
@@ -411,21 +429,27 @@ def check_ema_signals(symbol, now_utc):
                 e50_prev = ema50_d[-3]
 
                 if prev_close_d < e50_prev and close_d >= e50:
-                    alerts.append({
-                        "kind": "ema_cross",
-                        "symbol": symbol,
-                        "text": "🌟🌟 日线收盘上穿 EMA50（大趋势转多）",
-                        "detail": f"收盘 ${close_d:.4f}  EMA50 ${e50:.4f}",
-                        "icon": "🚀",
-                    })
+                    key = f"ema50d_up:{symbol}:{dk}"
+                    if not already_fired(state, key):
+                        mark_fired(state, key)
+                        alerts.append({
+                            "kind": "ema_cross",
+                            "symbol": symbol,
+                            "text": "🌟🌟 日线收盘上穿 EMA50（大趋势转多）",
+                            "detail": f"收盘 ${close_d:.4f}  EMA50 ${e50:.4f}",
+                            "icon": "🚀",
+                        })
                 elif prev_close_d > e50_prev and close_d <= e50:
-                    alerts.append({
-                        "kind": "ema_cross",
-                        "symbol": symbol,
-                        "text": "🌟🌟 日线收盘下穿 EMA50（大趋势转空）",
-                        "detail": f"收盘 ${close_d:.4f}  EMA50 ${e50:.4f}",
-                        "icon": "⚠️",
-                    })
+                    key = f"ema50d_down:{symbol}:{dk}"
+                    if not already_fired(state, key):
+                        mark_fired(state, key)
+                        alerts.append({
+                            "kind": "ema_cross",
+                            "symbol": symbol,
+                            "text": "🌟🌟 日线收盘下穿 EMA50（大趋势转空）",
+                            "detail": f"收盘 ${close_d:.4f}  EMA50 ${e50:.4f}",
+                            "icon": "⚠️",
+                        })
     except Exception as e:
         print(f"[ema_1d:{symbol}] error: {e}")
 
@@ -481,8 +505,12 @@ def main():
             close_ts = last_closed[6] / 1000
             age = now_utc.timestamp() - close_ts
             if 0 <= age < 360:
+                vol_key = f"vol:{symbol}:{int(close_ts)}"
+                if already_fired(state, vol_key):
+                    continue
                 change = (close_p - open_p) / open_p
                 if abs(change) >= VOL_THRESHOLD:
+                    mark_fired(state, vol_key)
                     arrow = "📈" if change > 0 else "📉"
                     alerts.append(("vol", symbol, close_p, f"4H 振幅 {change*100:+.2f}%", arrow))
         except Exception as e:
@@ -492,7 +520,7 @@ def main():
     channel_alerts = []
     for symbol in CHANNEL_SYMBOLS:
         try:
-            ca = check_channel(symbol)
+            ca = check_channel(symbol, state, dk)
             if ca:
                 channel_alerts.append(ca)
         except Exception as e:
@@ -501,7 +529,7 @@ def main():
     # 4. EMA 触碰 / 穿越
     ema_alerts = []
     for symbol in EMA_SYMBOLS:
-        ema_alerts.extend(check_ema_signals(symbol, now_utc))
+        ema_alerts.extend(check_ema_signals(symbol, now_utc, state, dk))
 
     # 5. 破位反抽（对所有配了关键位的品种）
     retest_alerts = []
