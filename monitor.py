@@ -593,14 +593,20 @@ def check_ema_signals(symbol, now_utc, state, dk):
             last_closed = k4h[-2]
             if _bar_just_closed(last_closed, now_ts):
                 close_p = closes[-2]
-                prev_close = closes[-3]  # 上一根 4H 收盘
 
-                # A. EMA25 触碰
+                # K线极值（用于判断 EMA 是否穿过 K线）
+                last_low = float(last_closed[3])
+                last_high = float(last_closed[2])
+                prev_bar = k4h[-3]
+                prev_low = float(prev_bar[3])
+                prev_high = float(prev_bar[2])
+
+                # A. EMA25 触碰：K线上下影范围包含 EMA25 这条线
                 e25 = ema25[-2]
                 e25_prev = ema25[-3]
-                tol25 = e25 * 0.005
-                # 触碰 = 本次 K线收盘距 EMA25 ≤ 0.5%，上一根 > 0.5%
-                if abs(close_p - e25) <= tol25 and abs(prev_close - e25_prev) > tol25:
+                touched_now = last_low <= e25 <= last_high
+                touched_prev = prev_low <= e25_prev <= prev_high
+                if touched_now and not touched_prev:
                     key = f"ema25:{symbol}:{dk}"
                     if not already_fired(state, key):
                         mark_fired(state, key)
@@ -608,16 +614,17 @@ def check_ema_signals(symbol, now_utc, state, dk):
                         alerts.append({
                             "kind": "ema_touch",
                             "symbol": symbol,
-                            "text": f"4H 收盘 {side}触碰 EMA25",
-                            "detail": f"现价 ${close_p:.4f}  EMA25 ${e25:.4f}",
+                            "text": f"4H {side}触碰 EMA25",
+                            "detail": f"收盘 ${close_p:.4f}  EMA25 ${e25:.4f}  影线 ${last_low:.4f}-${last_high:.4f}",
                             "icon": "📊",
                         })
 
-                # B. EMA100 触碰
+                # B. EMA100 触碰：同样的严格判定
                 e100 = ema100[-2]
                 e100_prev = ema100[-3]
-                tol100 = e100 * 0.008
-                if abs(close_p - e100) <= tol100 and abs(prev_close - e100_prev) > tol100:
+                touched_now = last_low <= e100 <= last_high
+                touched_prev = prev_low <= e100_prev <= prev_high
+                if touched_now and not touched_prev:
                     key = f"ema100:{symbol}:{dk}"
                     if not already_fired(state, key):
                         mark_fired(state, key)
@@ -625,8 +632,8 @@ def check_ema_signals(symbol, now_utc, state, dk):
                         alerts.append({
                             "kind": "ema_touch",
                             "symbol": symbol,
-                            "text": f"🌟 4H 收盘 {side}触碰 EMA100（大级别支撑）",
-                            "detail": f"现价 ${close_p:.4f}  EMA100 ${e100:.4f}",
+                            "text": f"🌟 4H {side}触碰 EMA100（大级别支撑）",
+                            "detail": f"收盘 ${close_p:.4f}  EMA100 ${e100:.4f}  影线 ${last_low:.4f}-${last_high:.4f}",
                             "icon": "📊",
                         })
     except Exception as e:
