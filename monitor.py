@@ -220,9 +220,10 @@ def push_all(caption, photo_path=None):
     #     content = caption + ("\n\n> 📊 详细图表见 Telegram" if photo_path else "")
     #     send_pushplus(title, content)
 
-    # Bark iOS 推送
-    if BARK_KEY:
-        send_bark(title, caption)
+    # Bark 已停用（api.day.app 屏蔽了 Cloudflare WARP 出口 IP，VPS 无法访问）
+    # 如需从有 IPv4 直连的机器上恢复，取消下面注释
+    # if BARK_KEY:
+    #     send_bark(title, caption)
 
 
 def send_tg_photo(caption, photo_path):
