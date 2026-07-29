@@ -223,6 +223,8 @@ def _score_channel(upper_pts, lower_pts, n_bars, cur_price):
         "r2_lower": lr2,
         "slope_upper": us,
         "slope_lower": ls,
+        "upper_pts": list(upper_pts),
+        "lower_pts": list(lower_pts),
     }
 
 
@@ -254,6 +256,16 @@ def detect_channel(k2h):
     return best[1] if best else None
 
 
+def _anchor_str(k2h, idx, price):
+    """把 K线 index + 价格 转成锚点字符串: $XXX @ MM-DD HH:MM"""
+    try:
+        ts = int(k2h[idx][0]) / 1000
+        dt = datetime.datetime.utcfromtimestamp(ts)
+        return f"${price:.4g} @ {dt.strftime('%m-%d %H:%M')}"
+    except Exception:
+        return f"${price:.4g}"
+
+
 def check_channel(symbol, state, dk):
     """检查 symbol 是否触碰通道边界，返回 alert dict 或 None（带状态去重）"""
     k2h = klines(symbol, "2h", 200)
@@ -268,6 +280,46 @@ def check_channel(symbol, state, dk):
     lower = ch["lower"]
     tol = (upper - lower) * 0.05
 
+    def _build_trade_meta(touched, ch, k2h, current):
+        """构造交易参数：方向/止损/止盈/支撑压力/锚点"""
+        highs_d = [float(x[2]) for x in k2h]
+        lows_d = [float(x[3]) for x in k2h]
+        upper = ch["upper"]; lower = ch["lower"]
+
+        if touched == "upper":
+            direction = "SHORT"
+            entry = current
+            # 止损：通道上沿上方，取最近 20 根内的最高点 * 1.003 或 上沿 * 1.008 取更远者
+            recent_high = max(highs_d[-20:])
+            stop = max(recent_high * 1.003, upper * 1.008)
+            target = lower  # 通道另一侧
+        else:
+            direction = "LONG"
+            entry = current
+            recent_low = min(lows_d[-20:])
+            stop = min(recent_low * 0.997, lower * 0.992)
+            target = upper
+
+        # 盈亏比
+        risk = abs(entry - stop)
+        reward = abs(target - entry)
+        rr = reward / risk if risk > 0 else 0
+
+        # 支撑/压力：最近的对手 swing 极值
+        support = min(lows_d[-30:])
+        resistance = max(highs_d[-30:])
+
+        # 锚点（2H 通道对应的 swing 点）
+        anchors_up = [_anchor_str(k2h, i, p) for i, p in ch.get("upper_pts", [])[-2:]]
+        anchors_lo = [_anchor_str(k2h, i, p) for i, p in ch.get("lower_pts", [])[-2:]]
+
+        return {
+            "direction": direction,
+            "entry": entry, "stop": stop, "target": target,
+            "rr": rr, "support": support, "resistance": resistance,
+            "anchors_up": anchors_up, "anchors_lo": anchors_lo,
+        }
+
     # 遍历相邻收盘对
     for i in range(1, len(k5m) - 1):
         prev_c = float(k5m[i-1][4])
@@ -279,9 +331,10 @@ def check_channel(symbol, state, dk):
             if not already_fired(state, key):
                 mark_fired(state, key)
                 sig = "做多关注" if ch["direction"] == "上升通道" else "反弹关注（**逆势，谨慎**）"
+                meta = _build_trade_meta("lower", ch, k2h, current)
                 return {
                     "symbol": symbol, "type": "触碰下沿", "channel": ch,
-                    "price": current, "signal": sig,
+                    "price": current, "signal": sig, "meta": meta,
                 }
 
     # 触碰上沿
@@ -293,9 +346,10 @@ def check_channel(symbol, state, dk):
             if not already_fired(state, key):
                 mark_fired(state, key)
                 sig = "做空关注" if ch["direction"] == "下降通道" else "回落关注（**逆势，谨慎**）"
+                meta = _build_trade_meta("upper", ch, k2h, current)
                 return {
                     "symbol": symbol, "type": "触碰上沿", "channel": ch,
-                    "price": current, "signal": sig,
+                    "price": current, "signal": sig, "meta": meta,
                 }
 
     return None
@@ -587,17 +641,41 @@ def main():
 
     stamp = now_utc.strftime("%m-%d %H:%M UTC")
 
-    # === 通道信号：一个信号一张图 ===
+    # === 通道信号：一个信号一张图 + 完整交易参数 ===
     for ca in channel_alerts:
         ch = ca["channel"]
-        icon = "🔻" if ca["type"] == "触碰下沿" else "🔺"
-        caption = (
-            f"{icon} *{ca['symbol']}* 2H {ch['direction']} · {ca['type']}\n"
-            f"现价 `${ca['price']}`\n"
-            f"上沿 `${ch['upper']:.4g}` / 下沿 `${ch['lower']:.4g}`\n"
-            f"触点 {ch['touch_upper']}/{ch['touch_lower']}  R² {ch['r2_upper']:.2f}/{ch['r2_lower']:.2f}\n"
-            f"{ca['signal']}\n\n_{stamp}_"
-        )
+        icon = "🔻" if ca["type"] == "触碰上沿" else "🔺"  # 上沿=做空(红)，下沿=做多(绿)
+        m = ca.get("meta", {})
+        direction_tag = m.get("direction", "?")
+        entry = m.get("entry", ca["price"])
+        stop = m.get("stop", 0)
+        target = m.get("target", 0)
+        rr = m.get("rr", 0)
+
+        lines_c = []
+        lines_c.append(f"{icon} *{ca['symbol']}* · {ca['type']} · **{direction_tag}**")
+        lines_c.append("")
+        lines_c.append(f"📐 结构：2H {ch['direction']}  |  触点 {ch['touch_upper']}/{ch['touch_lower']}  R² {ch['r2_upper']:.2f}/{ch['r2_lower']:.2f}")
+        lines_c.append(f"💵 现价 `${ca['price']}`")
+        lines_c.append(f"📐 通道上沿 / 下沿：`${ch['upper']:.4g}` / `${ch['lower']:.4g}`")
+        lines_c.append("")
+        lines_c.append(f"🎯 参考入场：`${entry:.4g}`")
+        lines_c.append(f"🛑 参考止损：`${stop:.4g}`")
+        lines_c.append(f"🎯 参考止盈：`${target:.4g}`  (R:R = {rr:.2f})")
+        lines_c.append("")
+        lines_c.append(f"🟢 近30根支撑：`${m.get('support', 0):.4g}`")
+        lines_c.append(f"🔴 近30根压力：`${m.get('resistance', 0):.4g}`")
+        anchors_up = m.get("anchors_up", [])
+        anchors_lo = m.get("anchors_lo", [])
+        if anchors_up:
+            lines_c.append(f"📍 上沿锚点：{'  →  '.join(anchors_up)}")
+        if anchors_lo:
+            lines_c.append(f"📍 下沿锚点：{'  →  '.join(anchors_lo)}")
+        lines_c.append("")
+        lines_c.append(f"{ca['signal']}")
+        lines_c.append(f"⚠️ 仅监控提醒，不自动下单")
+        lines_c.append(f"_{stamp}_")
+        caption = "\n".join(lines_c)
         sent = False
         if CHART_ENABLED:
             try:
