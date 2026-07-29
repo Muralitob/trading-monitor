@@ -95,6 +95,40 @@ def send_tg(text):
     urllib.request.urlopen(req, timeout=10).read()
 
 
+def send_tg_photo(caption, photo_path):
+    """发送图片 + 文字说明"""
+    import uuid
+    url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+    boundary = uuid.uuid4().hex
+    with open(photo_path, "rb") as f:
+        photo_bytes = f.read()
+
+    def part(name, value, filename=None, content_type=None):
+        head = f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"'
+        if filename:
+            head += f'; filename="{filename}"'
+        head += "\r\n"
+        if content_type:
+            head += f"Content-Type: {content_type}\r\n"
+        head += "\r\n"
+        if isinstance(value, str):
+            value = value.encode()
+        return head.encode() + value + b"\r\n"
+
+    body = b""
+    body += part("chat_id", str(CHAT_ID))
+    body += part("caption", caption)
+    body += part("parse_mode", "Markdown")
+    body += part("photo", photo_bytes, filename="chart.png", content_type="image/png")
+    body += f"--{boundary}--\r\n".encode()
+
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    )
+    urllib.request.urlopen(req, timeout=20).read()
+
+
 # ==================== 通道识别 ====================
 
 def find_swings(highs, lows, window=3):
@@ -543,32 +577,102 @@ def main():
         print("No alerts triggered")
         return
 
-    # 组装消息
-    lines = ["🔔 *交易信号*", ""]
-    for kind, sym, price, desc, arrow in alerts:
-        lines.append(f"{arrow} *{sym}*  `${price}`")
-        lines.append(f"  {desc}")
-        lines.append("")
+    # 尝试加载 chart 模块（VPS 需要 apt install python3-matplotlib）
+    try:
+        import chart as chart_mod
+        CHART_ENABLED = True
+    except Exception as e:
+        print(f"[chart] disabled: {e}")
+        CHART_ENABLED = False
+
+    stamp = now_utc.strftime("%m-%d %H:%M UTC")
+
+    # === 通道信号：一个信号一张图 ===
     for ca in channel_alerts:
         ch = ca["channel"]
         icon = "🔻" if ca["type"] == "触碰下沿" else "🔺"
-        lines.append(f"{icon} *{ca['symbol']}* 2H {ch['direction']} · {ca['type']}")
-        lines.append(f"  现价 `${ca['price']}`")
-        lines.append(f"  上沿 `${ch['upper']:.2f}` / 下沿 `${ch['lower']:.2f}`")
-        lines.append(f"  触点 {ch['touch_upper']}/{ch['touch_lower']}  R² {ch['r2_upper']:.2f}/{ch['r2_lower']:.2f}")
-        lines.append(f"  {ca['signal']}")
-        lines.append("")
+        caption = (
+            f"{icon} *{ca['symbol']}* 2H {ch['direction']} · {ca['type']}\n"
+            f"现价 `${ca['price']}`\n"
+            f"上沿 `${ch['upper']:.4g}` / 下沿 `${ch['lower']:.4g}`\n"
+            f"触点 {ch['touch_upper']}/{ch['touch_lower']}  R² {ch['r2_upper']:.2f}/{ch['r2_lower']:.2f}\n"
+            f"{ca['signal']}\n\n_{stamp}_"
+        )
+        sent = False
+        if CHART_ENABLED:
+            try:
+                k2h = klines(ca["symbol"], "2h", 80)
+                png = chart_mod.chart_channel(ca["symbol"], ch, k2h)
+                send_tg_photo(caption, png)
+                try: os.remove(png)
+                except: pass
+                sent = True
+            except Exception as e:
+                print(f"[chart_channel:{ca['symbol']}] {e}")
+        if not sent:
+            send_tg(f"🔔 *交易信号*\n\n{caption}")
+
+    # === EMA 信号：一个信号一张图 ===
     for ea in ema_alerts:
-        lines.append(f"{ea['icon']} *{ea['symbol']}*  {ea['text']}")
-        lines.append(f"  {ea['detail']}")
-        lines.append("")
+        caption = f"{ea['icon']} *{ea['symbol']}*  {ea['text']}\n{ea['detail']}\n\n_{stamp}_"
+        sent = False
+        if CHART_ENABLED and ea.get("kind") == "ema_touch":
+            try:
+                sym = ea["symbol"]
+                k4h = klines(sym, "4h", 150)
+                closes_x = [float(k[4]) for k in k4h]
+                ema25s = _compute_ema(closes_x, 25) if len(closes_x) >= 25 else []
+                ema100s = _compute_ema(closes_x, 100) if len(closes_x) >= 100 else []
+                # 从 detail 里解析 EMA 值
+                is_ema100 = "EMA100" in ea["text"]
+                ema_name = "EMA100" if is_ema100 else "EMA25"
+                ema_val = (ema100s[-2] if is_ema100 else ema25s[-2]) if (ema25s and ema100s) else 0
+                png = chart_mod.chart_ema_touch(sym, k4h, ema25s, ema100s, closes_x[-2], ema_name, ema_val)
+                send_tg_photo(caption, png)
+                try: os.remove(png)
+                except: pass
+                sent = True
+            except Exception as e:
+                print(f"[chart_ema:{ea['symbol']}] {e}")
+        if not sent:
+            send_tg(f"🔔 *交易信号*\n\n{caption}")
+
+    # === 关键位穿越：一个信号一张图 ===
+    for tup in alerts:
+        kind, sym, price, desc, arrow = tup
+        caption = f"{arrow} *{sym}*  `${price}`\n{desc}\n\n_{stamp}_"
+        sent = False
+        if CHART_ENABLED and kind == "level":
+            try:
+                # 从 desc 里 grep 价位数字比较麻烦，直接不画 level 图，保留纯文本
+                pass
+            except Exception as e:
+                print(f"[chart_level:{sym}] {e}")
+        send_tg(f"🔔 *交易信号*\n\n{caption}")
+
+    # === 反抽信号：带图 ===
     for ra in retest_alerts:
-        lines.append(f"{ra['icon']} *{ra['symbol']}*  {ra['text']}")
-        lines.append(f"  现价 `${ra['price']}`  关键位 `${ra['level']:g}`")
-        lines.append("")
-    lines.append(f"_{now_utc.strftime('%m-%d %H:%M')} UTC · 仅监控提醒，不自动下单_")
-    send_tg("\n".join(lines))
+        caption = f"{ra['icon']} *{ra['symbol']}*  {ra['text']}\n现价 `${ra['price']}`  关键位 `${ra['level']:g}`\n\n_{stamp}_"
+        sent = False
+        if CHART_ENABLED:
+            try:
+                k5m = klines(ra["symbol"], "5m", 60)
+                png = chart_mod.chart_level(ra["symbol"], k5m, ra["level"], ra["price"], desc=ra["type"])
+                send_tg_photo(caption, png)
+                try: os.remove(png)
+                except: pass
+                sent = True
+            except Exception as e:
+                print(f"[chart_retest:{ra['symbol']}] {e}")
+        if not sent:
+            send_tg(f"🔔 *交易信号*\n\n{caption}")
+
     print(f"Sent: {len(alerts)} level/vol + {len(channel_alerts)} channel + {len(ema_alerts)} ema + {len(retest_alerts)} retest alerts")
+
+
+def _compute_ema(values, period):
+    """辅助：给主流程用的 EMA 计算（复用 ema_series）"""
+    return ema_series(values, period)
 
 
 if __name__ == "__main__":

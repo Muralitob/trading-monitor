@@ -12,7 +12,7 @@ fi
 
 echo "==> 安装依赖"
 apt-get update -qq
-apt-get install -y -qq git python3 curl
+apt-get install -y -qq git python3 python3-matplotlib curl cron
 
 REPO_DIR=/root/trading-monitor
 
