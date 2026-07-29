@@ -38,10 +38,32 @@ const VOL_THRESHOLD = 0.03;
 
 // ==================== 工具函数 ====================
 
+const FAPI_HOSTS = [
+  "fapi1.binance.com",
+  "fapi2.binance.com",
+  "fapi3.binance.com",
+  "fapi.binance.com",
+];
+
 async function klines(symbol, interval, limit) {
-  const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-  const resp = await fetch(url, { cf: { cacheTtl: 0 } });
-  return await resp.json();
+  let lastErr = null;
+  for (const host of FAPI_HOSTS) {
+    try {
+      const url = `https://${host}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+      const resp = await fetch(url, {
+        cf: { cacheTtl: 0 },
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+          "Accept": "application/json",
+        },
+      });
+      if (!resp.ok) { lastErr = `HTTP ${resp.status}`; continue; }
+      const text = await resp.text();
+      try { return JSON.parse(text); }
+      catch (e) { lastErr = `non-JSON (${text.slice(0, 60)})`; continue; }
+    } catch (e) { lastErr = e.message; }
+  }
+  throw new Error(`klines ${symbol} ${interval}: all hosts failed, last: ${lastErr}`);
 }
 
 async function sendTG(env, text) {

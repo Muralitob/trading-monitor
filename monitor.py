@@ -8,9 +8,40 @@ import os
 import json
 import urllib.request
 import datetime
+from pathlib import Path
 
 TOKEN = os.environ["TG_TOKEN"]
 CHAT_ID = os.environ["TG_CHAT"]
+
+# 状态文件（用于去重，避免 30 分钟窗口内重复告警）
+STATE_FILE = Path(__file__).parent / "state.json"
+
+def _load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+def _save_state(state):
+    # 清理 48 小时以前的旧记录
+    cutoff = datetime.datetime.utcnow().timestamp() - 48*3600
+    state = {k: v for k, v in state.items() if v > cutoff}
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+def already_fired(state, key):
+    """检查此告警是否 24h 内已推过"""
+    if key not in state:
+        return False
+    return (datetime.datetime.utcnow().timestamp() - state[key]) < 24*3600
+
+def mark_fired(state, key):
+    state[key] = datetime.datetime.utcnow().timestamp()
+
+def today_key():
+    d = datetime.datetime.utcnow()
+    return d.strftime("%Y%m%d")
 
 # ==================== 规则配置 ====================
 
@@ -226,68 +257,65 @@ def check_channel(symbol):
 
 # ==================== 反抽检测（Break & Retest） ====================
 
-def check_retest(symbol, rules, lookback_hours=24):
+def check_retest(symbol, rules, state, dk, lookback_hours=24):
     """
-    检测破位后反抽到关键位：
+    检测破位后反抽到关键位（滑动窗口 + 去重）：
       - 24 小时内 1H 收盘破位
-      - 现在 5m 收盘从破位反方向回到关键位附近
+      - 5m 收盘从破位反方向回到关键位附近
     """
     try:
         k1h = klines(symbol, "1h", lookback_hours + 2)
-        k5m = klines(symbol, "5m", 3)
+        k5m = klines(symbol, "5m", 8)
     except Exception as e:
         print(f"[retest:{symbol}] fetch error: {e}")
         return []
     if len(k1h) < 3 or len(k5m) < 3:
         return []
 
-    prev_prev_5m = float(k5m[-3][4])
-    prev_5m = float(k5m[-2][4])
     current = float(k5m[-1][4])
-
     alerts = []
+
     for r in rules:
         level = r["level"]
-        tol = level * 0.005  # 0.5% 容差判定"接近"
+        tol = level * 0.005
 
-        # 查找 24h 内 1H K线是否有破位（收盘穿越）
-        broke_down = False  # 从上方破到下方
-        broke_up = False    # 从下方破到上方
-        break_time = None
-
-        for i in range(len(k1h) - 1):  # 不含最后一根（当前未收盘）
+        # 查找 24h 内 1H K线是否有破位
+        broke_down = False
+        broke_up = False
+        for i in range(len(k1h) - 1):
             o = float(k1h[i][1])
             c = float(k1h[i][4])
             if o > level and c < level - tol:
                 broke_down = True
-                break_time = k1h[i][6] / 1000
             elif o < level and c > level + tol:
                 broke_up = True
-                break_time = k1h[i][6] / 1000
 
-        # 破位后反抽做空（做空关注）
-        if broke_down and prev_prev_5m < level - tol and \
-           (level - tol) <= prev_5m <= (level + tol):
-            alerts.append({
-                "symbol": symbol,
-                "level": level,
-                "type": "反抽阻力",
-                "text": f"跌破 ${level:g} 后反抽 → **做空关注**",
-                "price": current,
-                "icon": "🔻",
-            })
+        # 滑动窗口检测反抽
+        for i in range(1, len(k5m) - 1):
+            prev_c = float(k5m[i-1][4])
+            curr_c = float(k5m[i][4])
 
-        # 突破后回踩做多（做多关注）
-        if broke_up and prev_prev_5m > level + tol and \
-           (level - tol) <= prev_5m <= (level + tol):
-            alerts.append({
-                "symbol": symbol,
-                "level": level,
-                "type": "回踩支撑",
-                "text": f"突破 ${level:g} 后回踩 → **做多关注**",
-                "price": current,
-                "icon": "🔺",
-            })
+            if broke_down and prev_c < level - tol and \
+               (level - tol) <= curr_c <= (level + tol):
+                key = f"retest_down:{symbol}:{level}:{dk}"
+                if not already_fired(state, key):
+                    mark_fired(state, key)
+                    alerts.append({
+                        "symbol": symbol, "level": level, "type": "反抽阻力",
+                        "text": f"跌破 ${level:g} 后反抽 → **做空关注**",
+                        "price": current, "icon": "🔻",
+                    })
+
+            if broke_up and prev_c > level + tol and \
+               (level - tol) <= curr_c <= (level + tol):
+                key = f"retest_up:{symbol}:{level}:{dk}"
+                if not already_fired(state, key):
+                    mark_fired(state, key)
+                    alerts.append({
+                        "symbol": symbol, "level": level, "type": "回踩支撑",
+                        "text": f"突破 ${level:g} 后回踩 → **做多关注**",
+                        "price": current, "icon": "🔺",
+                    })
 
     return alerts
 
@@ -416,19 +444,30 @@ def main():
 
     alerts = []
 
-    # 1. 关键位穿越
+    # 1. 关键位穿越（30 分钟滑动窗口 + 状态去重）
+    state = _load_state()
+    dk = today_key()
     for symbol, rules in RULES.items():
         try:
-            k = klines(symbol, "5m", 3)
-            prev_prev_close = float(k[-3][4])
-            prev_close = float(k[-2][4])
-            current = float(k[-1][4])
-            for r in rules:
-                lv = r["level"]
-                if r["dir"] == "up" and prev_prev_close < lv and prev_close >= lv:
-                    alerts.append(("level", symbol, current, r["desc"], "⬆️"))
-                elif r["dir"] == "down" and prev_prev_close > lv and prev_close <= lv:
-                    alerts.append(("level", symbol, current, r["desc"], "⬇️"))
+            # 拉最近 8 根 5m K线（40 分钟窗口）
+            k = klines(symbol, "5m", 8)
+            current = float(k[-1][4])  # 最新价（未收盘）
+            # 遍历相邻收盘对 (i-1, i)，找首次穿越
+            for i in range(1, len(k) - 1):  # 跳过 -1（未收盘），检查 [0..len-2]
+                prev_c = float(k[i-1][4])
+                curr_c = float(k[i][4])
+                for r in rules:
+                    lv = r["level"]
+                    ddir = r["dir"]
+                    key = f"level:{symbol}:{lv}:{ddir}:{dk}"
+                    if ddir == "up" and prev_c < lv and curr_c >= lv:
+                        if not already_fired(state, key):
+                            mark_fired(state, key)
+                            alerts.append(("level", symbol, current, r["desc"], "⬆️"))
+                    elif ddir == "down" and prev_c > lv and curr_c <= lv:
+                        if not already_fired(state, key):
+                            mark_fired(state, key)
+                            alerts.append(("level", symbol, current, r["desc"], "⬇️"))
         except Exception as e:
             print(f"[level:{symbol}] error: {e}")
 
@@ -467,7 +506,10 @@ def main():
     # 5. 破位反抽（对所有配了关键位的品种）
     retest_alerts = []
     for symbol, rules in RULES.items():
-        retest_alerts.extend(check_retest(symbol, rules))
+        retest_alerts.extend(check_retest(symbol, rules, state, dk))
+
+    # 保存去重状态
+    _save_state(state)
 
     if not alerts and not channel_alerts and not ema_alerts and not retest_alerts:
         print("No alerts triggered")

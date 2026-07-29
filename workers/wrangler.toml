@@ -9,4 +9,4 @@ crons = ["*/5 * * * *"]
 # KV 存储去重状态（部署时会自动生成 binding）
 [[kv_namespaces]]
 binding = "KV"
-id = "REPLACE_WITH_KV_ID"
+id = "5e54830acd024654922d4c85e4ad9225"

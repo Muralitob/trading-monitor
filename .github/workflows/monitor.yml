@@ -2,13 +2,20 @@ name: Price Monitor
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # 每 5 分钟触发
-  workflow_dispatch:        # 允许在网页上手动触发（用来测试）
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+# 避免多个 run 并发导致状态文件冲突
+concurrency:
+  group: monitor
+  cancel-in-progress: false
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 4
+    permissions:
+      contents: write   # 允许 commit state.json 回仓库
     steps:
       - uses: actions/checkout@v4
 
@@ -21,3 +28,15 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
         run: python monitor.py
+
+      - name: Persist state
+        run: |
+          if [ -f state.json ]; then
+            git config user.name "monitor-bot"
+            git config user.email "bot@monitor.local"
+            git add state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "state update [skip ci]"
+              git push
+            fi
+          fi

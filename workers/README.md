@@ -1,62 +1,27 @@
-# Cloudflare Workers 部署指南
+# Cloudflare Workers 迁移记录（未完成）
 
-## 前提
-- Cloudflare 账号（免费注册 https://dash.cloudflare.com/sign-up）
-- Node.js 18+（Mac 自带或从 https://nodejs.org 装）
+## ⚠️ 已废弃：Binance 封了 Cloudflare 边缘 IP
 
-## 一次性设置（10 分钟）
+2026-07-28 尝试迁移到 Cloudflare Workers，但发现：
+- Binance `fapi.binance.com` 及所有镜像域名（fapi1/2/3）都对 Cloudflare Workers IP 返回 **HTTP 403**
+- 这是币安的反爬虫策略，网上多有报告
+- 无法通过 User-Agent 头绕过
 
-### 1. 安装 Wrangler CLI
-```bash
-npm install -g wrangler
-```
+**结论**：Cloudflare Workers 无法直接访问 Binance 合约 API。
 
-### 2. 登录 Cloudflare
-```bash
-wrangler login
-```
-会弹浏览器让你授权，点同意就行。
+## 保留原因
 
-### 3. 创建 KV 命名空间（用于去重）
-```bash
-cd /Users/mura/Documents/invest/trading-monitor/workers
-wrangler kv namespace create "KV"
-```
-会输出类似：
-```
-[[kv_namespaces]]
-binding = "KV"
-id = "abc123..."
-```
-**把 id 复制到 `wrangler.toml` 里替换 `REPLACE_WITH_KV_ID`。**
+代码保留在此，作为将来的备用方案。如果币安放开 CF IP，或者我们要用其他数据源（例如 CoinGecko），可以复用架构。
 
-### 4. 设置 Secrets（Telegram Token 和 Chat ID）
-```bash
-wrangler secret put TG_TOKEN
-# 粘贴：8618129888:AAHnK9ZEp159a81TThUogYTwvsq9D0F8N6E
+## 当前生产系统
 
-wrangler secret put TG_CHAT
-# 粘贴：1626067349
-```
+回到 `../monitor.py`（Python）+ `../.github/workflows/monitor.yml`（GitHub Actions）。
 
-### 5. 部署
-```bash
-wrangler deploy
-```
-输出会包含一个 URL，形如 `https://trading-monitor.YOUR_SUBDOMAIN.workers.dev`
+修复了两个关键问题：
+1. **滑动窗口**：从 5min 拉到 30-40min，容忍 cron 延迟
+2. **状态去重**：`state.json` 存最近 24h 触发过的信号，避免同一信号重复推送
 
-### 6. 测试
-浏览器打开：`https://trading-monitor.YOUR_SUBDOMAIN.workers.dev/test`
-应该收到 Telegram 测试消息。
-
-再打开 `/run` 手动跑一次监控。
-
-## 之后修改代码
-1. 编辑 `worker.js`
-2. `wrangler deploy` 一句话搞定
-
-## 停机
-Cloudflare Dashboard → Workers → trading-monitor → Settings → Delete
-
-## 关闭 GitHub Actions（避免重复推送）
-GitHub 仓库 → Actions → Price Monitor → 三点菜单 → Disable workflow
+## 已花费成本
+- $0（Cloudflare 账号未部署任何计费服务）
+- 一个 KV namespace（免费额度内）
+- 一个 Worker 已部署但会因 fetch 失败自动 no-op，可以留着或删除
