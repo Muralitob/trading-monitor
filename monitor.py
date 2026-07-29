@@ -14,6 +14,8 @@ TOKEN = os.environ["TG_TOKEN"]
 CHAT_ID = os.environ["TG_CHAT"]
 # 可选：企业微信群机器人 key（有则并行推送）
 WECOM_KEY = os.environ.get("WECOM_KEY", "").strip()
+# 可选：PushPlus token（微信推送）
+PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "").strip()
 
 # 状态文件（用于去重，避免 30 分钟窗口内重复告警）
 STATE_FILE = Path(__file__).parent / "state.json"
@@ -147,17 +149,53 @@ def send_wecom_image(photo_path):
         print(f"[wecom image] {e}")
 
 
+def send_pushplus(title, content):
+    """PushPlus 微信推送。content 用 markdown 格式。"""
+    if not PUSHPLUS_TOKEN:
+        return
+    try:
+        payload = {
+            "token": PUSHPLUS_TOKEN,
+            "title": title,
+            "content": content,
+            "template": "markdown",
+        }
+        req = urllib.request.Request(
+            "https://www.pushplus.plus/send",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:
+        print(f"[pushplus] {e}")
+
+
+def _extract_title(caption):
+    """从 caption 提取标题（第一行）"""
+    first_line = caption.split("\n", 1)[0]
+    # 去 markdown 字符
+    return _strip_md(first_line).strip()[:60] or "交易信号"
+
+
 def push_all(caption, photo_path=None):
-    """同时推 Telegram 和 企业微信（有 key 才推）"""
+    """同时推 Telegram / 企业微信 / PushPlus（有配置才推）"""
     if photo_path:
         try: send_tg_photo(caption, photo_path)
         except Exception as e: print(f"[tg photo] {e}")
-        send_wecom_image(photo_path)   # 图片
-        send_wecom_text(caption)       # 文字（企业微信不支持 caption）
+        send_wecom_image(photo_path)   # 企业微信：图 + 文分开
+        send_wecom_text(caption)
     else:
         try: send_tg(caption)
         except Exception as e: print(f"[tg text] {e}")
         send_wecom_text(caption)
+
+    # PushPlus 只发文字（附一条"见Telegram图"提示如果有图）
+    if PUSHPLUS_TOKEN:
+        title = _extract_title(caption)
+        content = caption
+        if photo_path:
+            content = content + "\n\n> 📊 详细图表见 Telegram"
+        send_pushplus(title, content)
 
 
 def send_tg_photo(caption, photo_path):
