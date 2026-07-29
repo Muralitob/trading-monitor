@@ -16,6 +16,8 @@ CHAT_ID = os.environ["TG_CHAT"]
 WECOM_KEY = os.environ.get("WECOM_KEY", "").strip()
 # 可选：PushPlus token（微信推送）
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "").strip()
+# 可选：Bark key（iOS 推送）
+BARK_KEY = os.environ.get("BARK_KEY", "").strip()
 
 # 状态文件（用于去重，避免 30 分钟窗口内重复告警）
 STATE_FILE = Path(__file__).parent / "state.json"
@@ -149,6 +151,27 @@ def send_wecom_image(photo_path):
         print(f"[wecom image] {e}")
 
 
+def send_bark(title, body):
+    """Bark iOS 推送"""
+    if not BARK_KEY:
+        return
+    try:
+        payload = {
+            "title": title,
+            "body": _strip_md(body)[:2000],  # Bark 有长度限制
+            "sound": "bell",
+            "group": "trading-monitor",  # iOS 通知分组
+        }
+        req = urllib.request.Request(
+            f"https://api.day.app/{BARK_KEY}",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:
+        print(f"[bark] {e}")
+
+
 def send_pushplus(title, content):
     """PushPlus 微信推送。content 用 markdown 格式。"""
     if not PUSHPLUS_TOKEN:
@@ -189,13 +212,18 @@ def push_all(caption, photo_path=None):
         except Exception as e: print(f"[tg text] {e}")
         send_wecom_text(caption)
 
-    # PushPlus 只发文字（附一条"见Telegram图"提示如果有图）
+    title = _extract_title(caption)
+
+    # PushPlus 只发文字
     if PUSHPLUS_TOKEN:
-        title = _extract_title(caption)
         content = caption
         if photo_path:
             content = content + "\n\n> 📊 详细图表见 Telegram"
         send_pushplus(title, content)
+
+    # Bark iOS 推送
+    if BARK_KEY:
+        send_bark(title, caption)
 
 
 def send_tg_photo(caption, photo_path):
