@@ -214,12 +214,11 @@ def push_all(caption, photo_path=None):
 
     title = _extract_title(caption)
 
-    # PushPlus 只发文字
-    if PUSHPLUS_TOKEN:
-        content = caption
-        if photo_path:
-            content = content + "\n\n> 📊 详细图表见 Telegram"
-        send_pushplus(title, content)
+    # PushPlus 已停用（用户 2026-07-29 决定）
+    # 如需恢复，取消下面 3 行注释
+    # if PUSHPLUS_TOKEN:
+    #     content = caption + ("\n\n> 📊 详细图表见 Telegram" if photo_path else "")
+    #     send_pushplus(title, content)
 
     # Bark iOS 推送
     if BARK_KEY:
