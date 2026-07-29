@@ -1,0 +1,12 @@
+name = "trading-monitor"
+main = "worker.js"
+compatibility_date = "2026-07-01"
+
+# 每 5 分钟触发一次
+[triggers]
+crons = ["*/5 * * * *"]
+
+# KV 存储去重状态（部署时会自动生成 binding）
+[[kv_namespaces]]
+binding = "KV"
+id = "REPLACE_WITH_KV_ID"
