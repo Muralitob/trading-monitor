@@ -29,6 +29,7 @@ echo "==> 写入 .env"
 cat > "$REPO_DIR/.env" <<EOF
 export TG_TOKEN="$TG_TOKEN"
 export TG_CHAT="$TG_CHAT"
+export WECOM_KEY="${WECOM_KEY:-}"
 EOF
 chmod 600 "$REPO_DIR/.env"
 

@@ -12,6 +12,8 @@ from pathlib import Path
 
 TOKEN = os.environ["TG_TOKEN"]
 CHAT_ID = os.environ["TG_CHAT"]
+# 可选：企业微信群机器人 key（有则并行推送）
+WECOM_KEY = os.environ.get("WECOM_KEY", "").strip()
 
 # 状态文件（用于去重，避免 30 分钟窗口内重复告警）
 STATE_FILE = Path(__file__).parent / "state.json"
@@ -93,6 +95,69 @@ def send_tg(text):
     }).encode()
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=10).read()
+
+
+def _strip_md(text):
+    """把 Telegram Markdown 转成 WeCom 能用的纯文本（去掉 `*` `_` `` ` ``）"""
+    import re
+    t = text
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)     # **粗体**
+    t = re.sub(r"\*(.+?)\*", r"\1", t)         # *斜体*
+    t = re.sub(r"_(.+?)_", r"\1", t)           # _斜体_
+    t = t.replace("`", "")                     # 去除反引号
+    return t
+
+
+def send_wecom_text(text):
+    """发文本到企业微信群机器人（WECOM_KEY 未设置则跳过）"""
+    if not WECOM_KEY:
+        return
+    try:
+        url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WECOM_KEY}"
+        data = json.dumps({
+            "msgtype": "text",
+            "text": {"content": _strip_md(text)},
+        }).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:
+        print(f"[wecom text] {e}")
+
+
+def send_wecom_image(photo_path):
+    """发图片到企业微信群机器人"""
+    if not WECOM_KEY:
+        return
+    try:
+        import base64, hashlib
+        with open(photo_path, "rb") as f:
+            img = f.read()
+        payload = {
+            "msgtype": "image",
+            "image": {
+                "base64": base64.b64encode(img).decode(),
+                "md5": hashlib.md5(img).hexdigest(),
+            }
+        }
+        url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={WECOM_KEY}"
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=15).read()
+    except Exception as e:
+        print(f"[wecom image] {e}")
+
+
+def push_all(caption, photo_path=None):
+    """同时推 Telegram 和 企业微信（有 key 才推）"""
+    if photo_path:
+        try: send_tg_photo(caption, photo_path)
+        except Exception as e: print(f"[tg photo] {e}")
+        send_wecom_image(photo_path)   # 图片
+        send_wecom_text(caption)       # 文字（企业微信不支持 caption）
+    else:
+        try: send_tg(caption)
+        except Exception as e: print(f"[tg text] {e}")
+        send_wecom_text(caption)
 
 
 def send_tg_photo(caption, photo_path):
@@ -681,14 +746,14 @@ def main():
             try:
                 k2h = klines(ca["symbol"], "2h", 80)
                 png = chart_mod.chart_channel(ca["symbol"], ch, k2h)
-                send_tg_photo(caption, png)
+                push_all(caption, png)
                 try: os.remove(png)
                 except: pass
                 sent = True
             except Exception as e:
                 print(f"[chart_channel:{ca['symbol']}] {e}")
         if not sent:
-            send_tg(f"🔔 *交易信号*\n\n{caption}")
+            push_all(f"🔔 *交易信号*\n\n{caption}")
 
     # === EMA 信号：一个信号一张图 ===
     for ea in ema_alerts:
@@ -706,14 +771,14 @@ def main():
                 ema_name = "EMA100" if is_ema100 else "EMA25"
                 ema_val = (ema100s[-2] if is_ema100 else ema25s[-2]) if (ema25s and ema100s) else 0
                 png = chart_mod.chart_ema_touch(sym, k4h, ema25s, ema100s, closes_x[-2], ema_name, ema_val)
-                send_tg_photo(caption, png)
+                push_all(caption, png)
                 try: os.remove(png)
                 except: pass
                 sent = True
             except Exception as e:
                 print(f"[chart_ema:{ea['symbol']}] {e}")
         if not sent:
-            send_tg(f"🔔 *交易信号*\n\n{caption}")
+            push_all(f"🔔 *交易信号*\n\n{caption}")
 
     # === 关键位穿越：一个信号一张图 ===
     for tup in alerts:
@@ -726,7 +791,7 @@ def main():
                 pass
             except Exception as e:
                 print(f"[chart_level:{sym}] {e}")
-        send_tg(f"🔔 *交易信号*\n\n{caption}")
+        push_all(f"🔔 *交易信号*\n\n{caption}")
 
     # === 反抽信号：带图 ===
     for ra in retest_alerts:
@@ -736,14 +801,14 @@ def main():
             try:
                 k5m = klines(ra["symbol"], "5m", 60)
                 png = chart_mod.chart_level(ra["symbol"], k5m, ra["level"], ra["price"], desc=ra["type"])
-                send_tg_photo(caption, png)
+                push_all(caption, png)
                 try: os.remove(png)
                 except: pass
                 sent = True
             except Exception as e:
                 print(f"[chart_retest:{ra['symbol']}] {e}")
         if not sent:
-            send_tg(f"🔔 *交易信号*\n\n{caption}")
+            push_all(f"🔔 *交易信号*\n\n{caption}")
 
     print(f"Sent: {len(alerts)} level/vol + {len(channel_alerts)} channel + {len(ema_alerts)} ema + {len(retest_alerts)} retest alerts")
 
