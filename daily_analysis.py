@@ -20,8 +20,11 @@ def analyze_symbol(sym):
         highs_4h = [float(k[2]) for k in k4h]
         lows_4h = [float(k[3]) for k in k4h]
 
-        ema25 = ema_series(closes_4h, 25)[-1] if len(closes_4h) >= 25 else None
-        ema100 = ema_series(closes_4h, 100)[-1] if len(closes_4h) >= 100 else None
+        # 4H 五条 EMA
+        emas = {}
+        for period in (12, 21, 52, 100, 200):
+            if len(closes_4h) >= period + 3:
+                emas[f"EMA{period}"] = ema_series(closes_4h, period)[-1]
         ema50d = ema_series(closes_1d, 50)[-1] if len(closes_1d) >= 50 else None
         cur = closes_4h[-1]
 
@@ -39,7 +42,8 @@ def analyze_symbol(sym):
             "short": sym.replace("USDT", ""),
             "price": cur,
             "change_24h": change_24h,
-            "ema25": ema25, "ema100": ema100, "ema50d": ema50d,
+            "emas": emas,   # {"EMA12":..., "EMA21":..., "EMA52":..., "EMA100":..., "EMA200":...}
+            "ema50d": ema50d,
             "ema50d_dist": (closes_1d[-1] - ema50d) / ema50d * 100 if ema50d else 0,
             "recent_high": recent_high,
             "recent_low": recent_low,
@@ -70,8 +74,7 @@ def build_plan(d):
     - reason: 简述
     """
     cur = d["price"]
-    ema25 = d["ema25"]
-    ema100 = d["ema100"]
+    emas = d.get("emas", {})
     ch = d["channel"]
     trend = d["ema50d_dist"]
 
@@ -83,10 +86,11 @@ def build_plan(d):
     else:
         bias = "FLAT"
 
-    # 收集当前价上方的"阻力候选"和下方的"支撑候选"
+    # 收集当前价上方的"阻力候选"和下方的"支撑候选"（用 5 条 EMA）
     resistances = []
     supports = []
-    for name, val in [("EMA25", ema25), ("EMA100", ema100)]:
+    for name in ("EMA12", "EMA21", "EMA52", "EMA100", "EMA200"):
+        val = emas.get(name)
         if val is None: continue
         if val > cur * 1.001:
             resistances.append((name, val))
