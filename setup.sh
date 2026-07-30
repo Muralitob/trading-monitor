@@ -32,6 +32,7 @@ export TG_CHAT="$TG_CHAT"
 export WECOM_KEY="${WECOM_KEY:-}"
 export PUSHPLUS_TOKEN="${PUSHPLUS_TOKEN:-}"
 export BARK_KEY="${BARK_KEY:-}"
+export FEISHU_WEBHOOK="${FEISHU_WEBHOOK:-}"
 EOF
 chmod 600 "$REPO_DIR/.env"
 

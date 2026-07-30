@@ -18,6 +18,8 @@ WECOM_KEY = os.environ.get("WECOM_KEY", "").strip()
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "").strip()
 # 可选：Bark key（iOS 推送）
 BARK_KEY = os.environ.get("BARK_KEY", "").strip()
+# 可选：飞书群机器人 webhook URL 或 key
+FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK", "").strip()
 
 # 状态文件（用于去重，避免 30 分钟窗口内重复告警）
 STATE_FILE = Path(__file__).parent / "state.json"
@@ -151,6 +153,28 @@ def send_wecom_image(photo_path):
         print(f"[wecom image] {e}")
 
 
+def send_feishu(text, title=None):
+    """发送到飞书群机器人（text 用普通文本）"""
+    if not FEISHU_WEBHOOK:
+        return
+    try:
+        # 允许传完整 URL 或只传 key
+        url = FEISHU_WEBHOOK if FEISHU_WEBHOOK.startswith("http") else \
+              f"https://open.feishu.cn/open-apis/bot/v2/hook/{FEISHU_WEBHOOK}"
+        content = _strip_md(text)
+        if title:
+            content = f"[{title}]\n\n{content}"
+        payload = {"msg_type": "text", "content": {"text": content}}
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:
+        print(f"[feishu] {e}")
+
+
 def send_bark(title, body):
     """Bark iOS 推送"""
     if not BARK_KEY:
@@ -214,16 +238,12 @@ def push_all(caption, photo_path=None):
 
     title = _extract_title(caption)
 
-    # PushPlus 已停用（用户 2026-07-29 决定）
-    # 如需恢复，取消下面 3 行注释
-    # if PUSHPLUS_TOKEN:
-    #     content = caption + ("\n\n> 📊 详细图表见 Telegram" if photo_path else "")
-    #     send_pushplus(title, content)
+    # 飞书推送（有 webhook 就推）
+    if FEISHU_WEBHOOK:
+        send_feishu(caption, title)
 
-    # Bark 已停用（api.day.app 屏蔽了 Cloudflare WARP 出口 IP，VPS 无法访问）
-    # 如需从有 IPv4 直连的机器上恢复，取消下面注释
-    # if BARK_KEY:
-    #     send_bark(title, caption)
+    # PushPlus 已停用
+    # Bark 已停用（api.day.app 屏蔽 Cloudflare WARP 出口 IP）
 
 
 def send_tg_photo(caption, photo_path):
