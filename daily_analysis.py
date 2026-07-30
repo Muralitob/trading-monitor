@@ -240,49 +240,31 @@ def build_card(symbols_data):
     elements.append({"tag": "div", "text": {"tag": "lark_md", "content": header_text}})
     elements.append({"tag": "hr"})
 
-    # 表头
-    elements.append({
-        "tag": "div",
-        "fields": [
-            {"is_short": True, "text": {"tag": "lark_md", "content": "**标的**"}},
-            {"is_short": True, "text": {"tag": "lark_md", "content": "**当前价 · 24h**"}},
-            {"is_short": False, "text": {"tag": "lark_md", "content": "**今日预案** · 状态"}},
-        ],
-    })
-    elements.append({"tag": "hr"})
-
     # 按启用优先级排序：启用 > 已触发 > 观察 > 停用
     order = {"启用": 0, "已触发": 1, "观察": 2, "停用": 3}
     symbols_data.sort(key=lambda x: (order.get(x[1]["status"], 99), x[0]["short"]))
 
     for d, p in symbols_data:
-        # 24h 涨跌染色
         chg = d["change_24h"]
         chg_c = f"<font color='green'>+{chg:.2f}%</font>" if chg >= 0 else f"<font color='red'>{chg:.2f}%</font>"
-        # 趋势标签
         if d["ema50d_dist"] > 3:
-            tag = "<font color='green'>强多</font>"
+            tag = "<font color='green'>[强多]</font>"
         elif d["ema50d_dist"] < -3:
-            tag = "<font color='red'>强空</font>"
+            tag = "<font color='red'>[强空]</font>"
         else:
-            tag = "<font color='grey'>震荡</font>"
+            tag = "<font color='grey'>[震荡]</font>"
 
-        left = f"**`{d['short']}`**\n{tag}"
-        mid = f"**{fmt(d['price'])}**\n{chg_c}"
         plan_text = render_plan_text(d, p)
-        status_text = f"{status_badge(p['status'])}"
+        status_text = status_badge(p["status"])
         if p["status_reason"]:
-            status_text += f"  <font color='grey'>· {p['status_reason']}</font>"
-        right = f"{plan_text}\n{status_text}"
+            status_text += f" <font color='grey'>· {p['status_reason']}</font>"
 
-        elements.append({
-            "tag": "div",
-            "fields": [
-                {"is_short": True, "text": {"tag": "lark_md", "content": left}},
-                {"is_short": True, "text": {"tag": "lark_md", "content": mid}},
-                {"is_short": False, "text": {"tag": "lark_md", "content": right}},
-            ],
-        })
+        content = (
+            f"**{d['short']}** {tag}  ·  {fmt(d['price'])}  ·  {chg_c}\n"
+            f"　{plan_text}\n"
+            f"　{status_text}"
+        )
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": content}})
 
     elements.append({"tag": "hr"})
     elements.append({
