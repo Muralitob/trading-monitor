@@ -1,208 +1,281 @@
 """
-Open Interest (OI) 异动监控 · 每 5 分钟扫描
-目标：找刚突破 / 刚起势的机会
+OI + 第一波突破扫描器 · 每 5 分钟
 
-逻辑：
-1. 拉合约成交量 top 100 品种（当日热门）
-2. 对每个，比较当前 OI vs 15/30 分钟前的 OI
-3. 判定异动：
-   - "起势多"：OI +3%↑ + 价格 +1~5%（涨且加仓）
-   - "起势空"：OI +3%↑ + 价格 -1~-5%（跌且加仓）
-   - "空头回补"：OI -3%↓ + 价格 +1~3%（涨且减仓 = 空头认输）
-   - "多头砸盘"：OI -3%↓ + 价格 -1~-3%（跌且减仓 = 多头割肉）
-4. 只推榜单前 5，避免刷屏
+分析顺序（对齐用户框架）：
+1. 日线趋势 — 只做"刚突破"，不追"已大涨"
+2. 流通量代理 — 用 24h 成交量筛选甜蜜区（$50M-5B）
+3. OI 结构 — OI 涨幅 vs 价格涨幅匹配度
+4. 成交量放大 — 当前 5m vs 20 根均值
+5. 综合打分 → 只推榜单前 5
+
+口诀：趋势先行，市值定空间；OI 看成本，资金看方向；只做第一波，不赌第二波。
 """
-import sys, os, json, urllib.request, datetime
+import sys, os, json, urllib.request, datetime, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from monitor import (
     _load_state, _save_state, already_fired, mark_fired, today_key,
-    push_all, send_feishu, FEISHU_WEBHOOK,
+    FEISHU_WEBHOOK,
 )
 
 BASE = "https://fapi.binance.com"
-TOP_N = 100                    # 扫描前 N 热门币
-ALERT_N = 5                    # 每次推送前 N 异动
-OI_CHANGE_MIN = 1.5            # OI 变化门槛 %（5min 窗口比 15min 敏感，降低门槛）
-PRICE_CHANGE_MIN = 0.5         # 价格变化门槛 %
-PRICE_CHANGE_MAX = 5.0         # 价格变化上限
-LOOKBACK_MIN = 5               # 回溯 5 分钟
+
+# ========== 参数 ==========
+TOP_N_SCAN = 150               # 扫描池 = 前 N 热门币
+ALERT_N = 5                    # 推送 top N
+
+# 门槛（5min 窗口）
+OI_MIN = 1.0                   # OI 变化 %
+PRICE_MIN = 0.5                # 价格变化 %
+
+# 筛"第一波"用
+VOL_24H_MIN_MM = 50            # 24h 成交量最低 50M（低于此=没资金推动）
+VOL_24H_MAX_MM = 5000          # 24h 成交量最高 5B（BTC/ETH 太大推不动）
+CHANGE_24H_MAX = 15            # 24h 涨/跌幅上限（超过=已经跑，不追）
+DIST_20D_HIGH_MAX = 8          # 距 20日高点 < 8% = 突破区
+VOL_SPIKE_MIN = 1.5            # 当前 5m 量 > 20根均值的 1.5 倍
 
 
-def fetch_json(url, timeout=10):
+def fetch(url, timeout=10):
     try:
         r = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         return json.loads(urllib.request.urlopen(r, timeout=timeout).read())
-    except Exception as e:
+    except Exception:
         return None
 
 
 def get_top_symbols():
-    """从 24h ticker 拿成交量 top N 的 USDT 永续合约"""
-    data = fetch_json(f"{BASE}/fapi/v1/ticker/24hr")
-    if not data:
-        return []
-    # 只要 USDT 永续
+    data = fetch(f"{BASE}/fapi/v1/ticker/24hr")
+    if not data: return []
     perp = [d for d in data if d["symbol"].endswith("USDT")]
     perp.sort(key=lambda x: -float(x.get("quoteVolume", 0)))
-    return perp[:TOP_N]
+    return perp[:TOP_N_SCAN]
 
 
 def get_oi_history(symbol, period="5m", limit=2):
-    """拿 OI 历史数据，limit=2 = 现在 + 5 分钟前"""
-    url = f"{BASE}/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}"
-    return fetch_json(url)
+    return fetch(f"{BASE}/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}")
 
 
-def classify(oi_change_pct, price_change_pct):
-    """把异动分类"""
-    if oi_change_pct > 0:
-        if price_change_pct > 0:
-            return "起势多", "🚀", "LONG"
-        elif price_change_pct < 0:
-            return "起势空", "💥", "SHORT"
+def analyze_symbol(t):
+    """分析单个品种，返回评分和信号 dict"""
+    sym = t["symbol"]
+    price = float(t["lastPrice"])
+    vol_24h_mm = float(t["quoteVolume"]) / 1e6
+    change_24h = float(t["priceChangePercent"])
+    high_24h = float(t["highPrice"])
+    low_24h = float(t["lowPrice"])
+
+    # 【预筛】24h 成交量甜蜜区
+    if vol_24h_mm < VOL_24H_MIN_MM or vol_24h_mm > VOL_24H_MAX_MM:
+        return None
+    # 【预筛】24h 变化不能超限（不追已大涨）
+    if abs(change_24h) > CHANGE_24H_MAX:
+        return None
+
+    # 拉 OI 历史
+    oi_hist = get_oi_history(sym, "5m", 2)
+    if not oi_hist or len(oi_hist) < 2:
+        return None
+    oi_now = float(oi_hist[-1]["sumOpenInterestValue"])
+    oi_past = float(oi_hist[0]["sumOpenInterestValue"])
+    if oi_past == 0: return None
+    oi_change = (oi_now - oi_past) / oi_past * 100
+
+    if abs(oi_change) < OI_MIN:
+        return None
+
+    # 5min 价格变化 + 成交量数据
+    k5m = fetch(f"{BASE}/fapi/v1/klines?symbol={sym}&interval=5m&limit=21")
+    if not k5m or len(k5m) < 21:
+        return None
+    prev_close = float(k5m[-2][4])  # 上一根 5m 收盘（即"5min 前"）
+    price_change = (price - prev_close) / prev_close * 100
+
+    if abs(price_change) < PRICE_MIN:
+        return None
+
+    # 当前 5m 成交量 vs 前 20 根均值（成交量放大）
+    current_vol = float(k5m[-1][7])
+    avg_vol = sum(float(k[7]) for k in k5m[-21:-1]) / 20
+    vol_spike = current_vol / avg_vol if avg_vol > 0 else 0
+
+    # 日线数据判断"刚突破"
+    k1d = fetch(f"{BASE}/fapi/v1/klines?symbol={sym}&interval=1d&limit=22")
+    if not k1d or len(k1d) < 22:
+        return None
+    high_20d = max(float(k[2]) for k in k1d[-21:-1])  # 过去 20 日不含今天
+    low_20d = min(float(k[3]) for k in k1d[-21:-1])
+    close_20d_avg = sum(float(k[4]) for k in k1d[-21:-1]) / 20
+
+    # 距 20日高点百分比
+    dist_20d_high = (high_20d - price) / high_20d * 100
+    dist_20d_low = (price - low_20d) / low_20d * 100
+
+    # 方向 & 类型
+    if oi_change > 0 and price_change > 0:
+        kind, icon, direction = "起势多", "🚀", "LONG"
+    elif oi_change > 0 and price_change < 0:
+        kind, icon, direction = "起势空", "💥", "SHORT"
+    elif oi_change < 0 and price_change > 0:
+        kind, icon, direction = "空头回补", "🔥", "LONG"
+    elif oi_change < 0 and price_change < 0:
+        kind, icon, direction = "多头砸盘", "🩸", "SHORT"
     else:
-        if price_change_pct > 0:
-            return "空头回补", "🔥", "LONG"  # 空头认输，可能延续
-        elif price_change_pct < 0:
-            return "多头砸盘", "🩸", "SHORT"
-    return None, None, None
+        return None
+
+    # ========== 综合打分 ==========
+    score = 0
+    reasons = []
+
+    # 1. 日线趋势 - 刚突破（越接近 20日高越好，但没突破）
+    if direction == "LONG":
+        if dist_20d_high < DIST_20D_HIGH_MAX:
+            score += 30
+            reasons.append(f"刚接近/突破20日高 (差{dist_20d_high:.1f}%)")
+        elif dist_20d_high < 15:
+            score += 10
+    else:  # SHORT
+        if dist_20d_low < DIST_20D_HIGH_MAX:
+            score += 30
+            reasons.append(f"刚接近/跌破20日低 (差{dist_20d_low:.1f}%)")
+
+    # 2. OI/价格 比例健康度（OI 涨幅 > 价格涨幅 = 主力建仓中）
+    oi_price_ratio = abs(oi_change) / abs(price_change) if price_change else 0
+    if 1.5 <= oi_price_ratio <= 5:
+        score += 25
+        reasons.append(f"OI增速>价格 (比{oi_price_ratio:.1f}x)")
+    elif 0.7 <= oi_price_ratio < 1.5:
+        score += 15
+        reasons.append(f"OI/价同步")
+    # 比 <0.7 说明拉盘无跟随（诱多/诱空），不加分
+
+    # 3. 成交量放大
+    if vol_spike > VOL_SPIKE_MIN:
+        score += 25
+        reasons.append(f"量能{vol_spike:.1f}x")
+    elif vol_spike > 1:
+        score += 10
+
+    # 4. 24h 未大涨
+    if abs(change_24h) < 5:
+        score += 10
+        reasons.append(f"24h{change_24h:+.1f}% (未过热)")
+    elif abs(change_24h) < 10:
+        score += 5
+
+    # 5. 甜蜜市值区
+    if 100 <= vol_24h_mm <= 1000:
+        score += 10
+        reasons.append(f"甜蜜量${vol_24h_mm:.0f}M")
+
+    return {
+        "symbol": sym, "price": price,
+        "oi_change": oi_change, "price_change": price_change,
+        "vol_24h_mm": vol_24h_mm, "change_24h": change_24h,
+        "vol_spike": vol_spike, "oi_price_ratio": oi_price_ratio,
+        "dist_20d_high": dist_20d_high, "dist_20d_low": dist_20d_low,
+        "kind": kind, "icon": icon, "direction": direction,
+        "score": score, "reasons": reasons,
+    }
 
 
 def scan():
-    print("拉 top 100 热门币...")
     tickers = get_top_symbols()
     if not tickers:
-        print("❌ 拉不到数据")
         return []
 
-    anomalies = []
+    results = []
     for i, t in enumerate(tickers):
-        sym = t["symbol"]
-        current_price = float(t["lastPrice"])
-        vol_24h = float(t["quoteVolume"]) / 1e6  # 单位百万 USDT
-
-        oi_hist = get_oi_history(sym, "5m", 2)
-        if not oi_hist or len(oi_hist) < 2:
-            continue
-
-        oi_now = float(oi_hist[-1]["sumOpenInterestValue"])
-        oi_past = float(oi_hist[0]["sumOpenInterestValue"])  # 5 分钟前
-        if oi_past == 0: continue
-
-        oi_change = (oi_now - oi_past) / oi_past * 100
-
-        # 价格 5 分钟变化
-        k5m = fetch_json(f"{BASE}/fapi/v1/klines?symbol={sym}&interval=5m&limit=2")
-        if not k5m or len(k5m) < 2:
-            continue
-        price_5m_ago = float(k5m[0][4])  # 5 分钟前收盘价
-        price_change = (current_price - price_5m_ago) / price_5m_ago * 100
-
-        # 过滤
-        if abs(oi_change) < OI_CHANGE_MIN:
-            continue
-        if abs(price_change) < PRICE_CHANGE_MIN or abs(price_change) > PRICE_CHANGE_MAX:
-            continue
-
-        kind, icon, direction = classify(oi_change, price_change)
-        if not kind:
-            continue
-
-        anomalies.append({
-            "symbol": sym, "price": current_price,
-            "oi_change": oi_change,
-            "price_change": price_change,
-            "vol_24h_mm": vol_24h,
-            "kind": kind, "icon": icon, "direction": direction,
-            "rank": i + 1,
-        })
-
-        # 每 30 个休息 1 秒避免限流
+        r = analyze_symbol(t)
+        if r and r["score"] >= 40:  # 最低门槛
+            results.append(r)
         if (i + 1) % 30 == 0:
-            import time; time.sleep(1)
+            time.sleep(1)
 
-    # 按 |OI 变化| × |价格变化| 排序（综合强度）
-    anomalies.sort(key=lambda x: -(abs(x["oi_change"]) * abs(x["price_change"])))
-    return anomalies
+    results.sort(key=lambda x: -x["score"])
+    return results
 
 
-def build_feishu_card(anomalies):
-    """把 top 异动做成飞书卡片"""
+def build_card(anomalies):
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-    lines = [f"扫描完成 · 前 100 热门币中检出 **{len(anomalies)}** 个异动"]
-    lines.append(f"仅推榜单前 {ALERT_N}，按综合强度排序\n")
+    lines = [f"扫描 {TOP_N_SCAN} 热门币，符合\"第一波\"标准的 **{len(anomalies)}** 个"]
+    lines.append(f"只推榜单前 {ALERT_N} · 综合打分排序\n")
 
-    for a in anomalies[:ALERT_N]:
+    for i, a in enumerate(anomalies[:ALERT_N], 1):
+        sym = a["symbol"].replace("USDT", "")
         oi_c = f"<font color='green'>+{a['oi_change']:.2f}%</font>" if a['oi_change'] > 0 else f"<font color='red'>{a['oi_change']:.2f}%</font>"
         p_c = f"<font color='green'>+{a['price_change']:.2f}%</font>" if a['price_change'] > 0 else f"<font color='red'>{a['price_change']:.2f}%</font>"
 
-        symbol_short = a['symbol'].replace('USDT', '')
-        lines.append(
-            f"{a['icon']} **{symbol_short}** · {a['kind']} · **{a['direction']}**\n"
-            f"　现价 `${a['price']:.5g}`  ·  5minOI {oi_c}  ·  5min价格 {p_c}\n"
-            f"　24h量 ${a['vol_24h_mm']:.1f}M  ·  成交量排名 #{a['rank']}"
-        )
-    lines.append(f"\n_{now.strftime('%m-%d %H:%M')} BJ · 每 5 分钟扫描_")
+        # 综合评分颜色
+        if a["score"] >= 80:
+            score_c = f"<font color='green'>**{a['score']}分**</font>"
+        elif a["score"] >= 60:
+            score_c = f"<font color='orange'>**{a['score']}分**</font>"
+        else:
+            score_c = f"<font color='grey'>{a['score']}分</font>"
 
+        lines.append(
+            f"**#{i} {a['icon']} {sym}** · {a['kind']} · **{a['direction']}** · {score_c}\n"
+            f"　现价 `${a['price']:.5g}`  5minOI {oi_c}  5min价 {p_c}\n"
+            f"　评分依据：{' / '.join(a['reasons'])}\n"
+            f"　24h量 ${a['vol_24h_mm']:.0f}M  ·  24h涨跌 {a['change_24h']:+.1f}%  ·  量能 {a['vol_spike']:.1f}x"
+        )
+
+    lines.append(f"\n_{now.strftime('%m-%d %H:%M')} BJ · 只做第一波，不赌第二波_")
+
+    template = "green" if anomalies and anomalies[0]["direction"] == "LONG" else "red"
     return {
         "config": {"wide_screen_mode": True},
         "header": {
-            "title": {"tag": "plain_text", "content": f"🔥 OI 异动扫描 · {now.strftime('%H:%M')}"},
-            "template": "red" if any(a["direction"] == "SHORT" for a in anomalies[:3]) else "green",
+            "title": {"tag": "plain_text", "content": f"🎯 第一波扫描 · {now.strftime('%H:%M')}"},
+            "template": template,
         },
         "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "\n\n".join(lines)}}],
     }
 
 
-def send_feishu_card(card):
-    if not FEISHU_WEBHOOK:
-        return
+def send_card(card):
+    if not FEISHU_WEBHOOK: return
     url = FEISHU_WEBHOOK if FEISHU_WEBHOOK.startswith("http") else \
           f"https://open.feishu.cn/open-apis/bot/v2/hook/{FEISHU_WEBHOOK}"
     payload = {"msg_type": "interactive", "card": card}
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-    )
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=10).read()
 
 
 def main():
     state = _load_state()
     dk = today_key()
+    now = datetime.datetime.utcnow()
 
-    anomalies = scan()
-    if not anomalies:
-        print("无异动")
+    results = scan()
+    if not results:
+        print("无符合条件的机会")
         return
 
-    # 去重：同一品种同方向 15 分钟内不重复推（5min 扫描 × 3）
+    # 去重：同一品种同方向 15 分钟内不重复推
+    slot = now.hour * 4 + now.minute // 15
     fresh = []
-    now = datetime.datetime.utcnow()
-    slot_15min = now.hour * 4 + now.minute // 15
-    for a in anomalies:
-        key = f"oi:{a['symbol']}:{a['direction']}:{dk}:{slot_15min}"
+    for r in results:
+        key = f"first_wave:{r['symbol']}:{r['direction']}:{dk}:{slot}"
         if already_fired(state, key):
             continue
         mark_fired(state, key)
-        fresh.append(a)
-
-    if not fresh:
-        print("所有异动都已推过（去重）")
-        _save_state(state)
-        return
+        fresh.append(r)
 
     _save_state(state)
 
-    # 只推榜单前 5
-    print(f"检出 {len(fresh)} 个新异动，推前 {ALERT_N} 个")
-    for a in fresh[:ALERT_N]:
-        print(f"  {a['icon']} {a['symbol']:<15} {a['kind']:<8} OI{a['oi_change']:+.2f}% 价格{a['price_change']:+.2f}%")
+    if not fresh:
+        print("所有信号都已推过")
+        return
 
-    card = build_feishu_card(fresh)
+    print(f"检出 {len(results)} 个候选，新鲜 {len(fresh)} 个")
+    for r in fresh[:ALERT_N]:
+        print(f"  {r['score']:>3}分 {r['icon']} {r['symbol']:<15} {r['kind']:<8} OI{r['oi_change']:+.2f}% 价{r['price_change']:+.2f}% 量{r['vol_spike']:.1f}x")
+
     if FEISHU_WEBHOOK:
         try:
-            send_feishu_card(card)
+            send_card(build_card(fresh))
             print("✓ 飞书推送成功")
         except Exception as e:
             print(f"飞书推送失败: {e}")
