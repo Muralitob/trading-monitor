@@ -657,10 +657,107 @@ def _check_ema_break(k_bar, prev_bar, ema_now, ema_prev, min_body_pct=0.003):
     return None, None
 
 
+def _scan_emas_on_bar(k_bars, ema_periods, is_daily=False):
+    """
+    在一根 K 线上扫描所有 EMA 的拒绝/突破形态
+    返回按 (action, direction) 分组的字典：
+      {"reject_SHORT": [(name, star, ema_val, meta), ...],
+       "reject_LONG":  [...],
+       "break_UP":     [...],
+       "break_DOWN":   [...]}
+    """
+    last_bar = k_bars[-2]
+    prev_bar = k_bars[-3]
+    closes = [float(k[4]) for k in k_bars]
+
+    groups = {"reject_SHORT": [], "reject_LONG": [], "break_UP": [], "break_DOWN": []}
+
+    for period, star, name in ema_periods:
+        if len(closes) < period + 5:
+            continue
+        ema = ema_series(closes, period)
+        e_now = ema[-2]
+        e_prev = ema[-3]
+
+        # 拒绝
+        rd, rm = _check_ema_rejection(last_bar, e_now, min_wick_ratio=1.0)
+        if rd:
+            groups[f"reject_{rd}"].append((name, star, e_now, rm))
+
+        # 突破
+        bd, bm = _check_ema_break(last_bar, prev_bar, e_now, e_prev)
+        if bd:
+            groups[f"break_{bd}"].append((name, star, e_now, bm))
+
+    return groups, last_bar
+
+
+def _emit_ema_group(symbol, group_hits, group_key, timeframe, is_daily, last_bar, state, dk):
+    """
+    把一个 group（如 reject_SHORT）里所有 EMA 合并成一条 alert
+    """
+    if not group_hits:
+        return None
+
+    action, direction = group_key.split("_")  # "reject","SHORT"
+    # 用最重要（最大 period）的 EMA 作为主 key，避免同事件反复推
+    main_name = group_hits[-1][0]  # 最后一个 = 最大 period（EMA_CONFIG 是升序）
+    star_max = ""
+    for _, s, _, _ in group_hits:
+        if len(s) > len(star_max):
+            star_max = s
+
+    if is_daily:
+        star_display = (star_max + "🌟") if star_max else "🌟"
+    else:
+        star_display = star_max
+
+    key = f"ema_{action}_{timeframe}:{group_key}:{symbol}:{dk}"
+    if already_fired(state, key):
+        return None
+    mark_fired(state, key)
+
+    # 描述
+    if action == "reject":
+        dir_zh = "拒绝上方（做空）" if direction == "SHORT" else "反弹上方（做多）"
+    else:
+        dir_zh = "上穿（做多）" if direction == "UP" else "下破（做空）"
+
+    close_p = float(last_bar[4])
+    low = float(last_bar[3])
+    high = float(last_bar[2])
+
+    ema_list = " / ".join(n for n, _, _, _ in group_hits)
+    ema_vals = "  ".join(f"{n} ${v:.4g}" for n, _, v, _ in group_hits)
+
+    if action == "reject":
+        avg_wick = sum(m["wick_ratio"] for _, _, _, m in group_hits) / len(group_hits)
+        icon = "📊" if not is_daily else "🚀"
+        text = f"{star_display + ' ' if star_display else ''}{timeframe.upper()} {dir_zh} · {ema_list}"
+        detail = (f"收盘 ${close_p:.4f}\n"
+                  f"{ema_vals}\n"
+                  f"影线 ${low:.4f}-${high:.4f}  拒绝比 {avg_wick:.2f}")
+    else:  # break
+        avg_dist = sum(m["dist_pct"] for _, _, _, m in group_hits) / len(group_hits)
+        arrow = "🚀" if direction == "UP" else "💥"
+        icon = arrow
+        text = f"{star_display + ' ' if star_display else ''}{arrow} {timeframe.upper()} {dir_zh} · {ema_list}"
+        detail = (f"收盘 ${close_p:.4f}\n"
+                  f"{ema_vals}\n"
+                  f"平均距 EMA {avg_dist:+.2f}%")
+
+    real_direction = direction if action == "reject" else ("LONG" if direction == "UP" else "SHORT")
+    return {
+        "kind": f"ema_{action}", "symbol": symbol,
+        "direction": real_direction,
+        "text": text, "detail": detail, "icon": icon,
+    }
+
+
 def check_ema_signals(symbol, now_utc, state, dk):
     """
-    EMA 拒绝形态检测（4H + 1D）
-    只在"K线影线触碰 EMA + 主体收在 EMA 拒绝侧"时触发
+    EMA 拒绝/突破检测（4H + 1D）
+    同品种同周期同方向的多条 EMA 合并推送为一条
     """
     now_ts = now_utc.timestamp()
     alerts = []
@@ -673,151 +770,29 @@ def check_ema_signals(symbol, now_utc, state, dk):
         (200, "🌟🌟", "EMA200"),
     ]
 
-    # ==== 4H EMA 拒绝 + 突破检测 ====
+    # ==== 4H ====
     try:
         k4h = klines(symbol, "4h", 250)
-        if len(k4h) < 3: return alerts
-
-        last_closed = k4h[-2]
-        if _bar_just_closed(last_closed, now_ts, tolerance_sec=480):
-            closes = [float(k[4]) for k in k4h]
-            prev_bar = k4h[-3]
-
-            for period, star, name in EMA_CONFIG:
-                if len(closes) < period + 5: continue
-                ema = ema_series(closes, period)
-                e_now = ema[-2]
-                e_prev = ema[-3]
-
-                # 拒绝形态
-                direction, meta = _check_ema_rejection(last_closed, e_now, min_wick_ratio=1.0)
-                if direction:
-                    key = f"ema_reject_4h:{name.lower()}:{direction}:{symbol}:{dk}"
-                    if not already_fired(state, key):
-                        mark_fired(state, key)
-                        dir_zh = "拒绝上方（做空）" if direction == "SHORT" else "反弹上方（做多）"
-                        close_p = float(last_closed[4])
-                        low = float(last_closed[3]); high = float(last_closed[2])
-                        alerts.append({
-                            "kind": "ema_reject", "symbol": symbol, "direction": direction,
-                            "text": f"{star + ' ' if star else ''}4H {name} · {dir_zh}",
-                            "detail": (f"收盘 ${close_p:.4f}  {name} ${e_now:.4f}\n"
-                                       f"影线 ${low:.4f}-${high:.4f}  拒绝比 {meta['wick_ratio']:.2f}"),
-                            "icon": "📊",
-                        })
-
-                # 突破形态
-                brk_dir, brk_meta = _check_ema_break(last_closed, prev_bar, e_now, e_prev)
-                if brk_dir:
-                    key = f"ema_break_4h:{name.lower()}:{brk_dir}:{symbol}:{dk}"
-                    if not already_fired(state, key):
-                        mark_fired(state, key)
-                        arrow = "🚀" if brk_dir == "UP" else "💥"
-                        dir_zh = "上穿（做多）" if brk_dir == "UP" else "下破（做空）"
-                        alerts.append({
-                            "kind": "ema_break", "symbol": symbol, "direction": brk_dir,
-                            "text": f"{star + ' ' if star else ''}{arrow} 4H {name} · {dir_zh}",
-                            "detail": (f"收盘 ${brk_meta['close']:.4f}  {name} ${brk_meta['ema']:.4f}\n"
-                                       f"距 EMA {brk_meta['dist_pct']:+.2f}%  实体 {brk_meta['body_pct']:.2f}%"),
-                            "icon": arrow,
-                        })
+        if len(k4h) >= 3 and _bar_just_closed(k4h[-2], now_ts, tolerance_sec=480):
+            groups, last_bar = _scan_emas_on_bar(k4h, EMA_CONFIG, is_daily=False)
+            for gk, hits in groups.items():
+                alert = _emit_ema_group(symbol, hits, gk, "4h", False, last_bar, state, dk)
+                if alert:
+                    alerts.append(alert)
     except Exception as e:
-        print(f"[ema_4h:{symbol}] error: {e}")
+        print(f"[ema_4h:{symbol}] {e}")
 
-    # ==== 1D EMA 拒绝 + 突破检测 ====
+    # ==== 1D ====
     try:
         k1d = klines(symbol, "1d", 250)
-        if len(k1d) < 3: return alerts
-
-        last_closed_d = k1d[-2]
-        if not _bar_just_closed(last_closed_d, now_ts, tolerance_sec=900):
-            return alerts
-
-        closes_d = [float(k[4]) for k in k1d]
-        prev_bar_d = k1d[-3]
-
-        for period, star, name in EMA_CONFIG:
-            if len(closes_d) < period + 5: continue
-            ema_d = ema_series(closes_d, period)
-            e_now = ema_d[-2]
-            e_prev = ema_d[-3]
-
-            # 日线信号升一档
-            display_star = star + "🌟" if star else "🌟"
-
-            # 拒绝
-            direction, meta = _check_ema_rejection(last_closed_d, e_now, min_wick_ratio=1.0)
-            if direction:
-                key = f"ema_reject_1d:{name.lower()}:{direction}:{symbol}:{dk}"
-                if not already_fired(state, key):
-                    mark_fired(state, key)
-                    dir_zh = "拒绝上方（做空）" if direction == "SHORT" else "反弹上方（做多）"
-                    close_p = float(last_closed_d[4])
-                    low = float(last_closed_d[3]); high = float(last_closed_d[2])
-                    alerts.append({
-                        "kind": "ema_reject", "symbol": symbol, "direction": direction,
-                        "text": f"{display_star} **1D {name} · {dir_zh}**",
-                        "detail": (f"日线收盘 ${close_p:.4f}  {name} ${e_now:.4f}\n"
-                                   f"影线 ${low:.4f}-${high:.4f}  拒绝比 {meta['wick_ratio']:.2f}"),
-                        "icon": "🚀",
-                    })
-
-            # 突破（日线突破极其重要）
-            brk_dir, brk_meta = _check_ema_break(last_closed_d, prev_bar_d, e_now, e_prev)
-            if brk_dir:
-                key = f"ema_break_1d:{name.lower()}:{brk_dir}:{symbol}:{dk}"
-                if not already_fired(state, key):
-                    mark_fired(state, key)
-                    arrow = "🚀" if brk_dir == "UP" else "💥"
-                    dir_zh = "上穿（做多信号）" if brk_dir == "UP" else "下破（做空信号）"
-                    alerts.append({
-                        "kind": "ema_break", "symbol": symbol, "direction": brk_dir,
-                        "text": f"{display_star} {arrow} **1D {name} · {dir_zh}**",
-                        "detail": (f"日线收盘 ${brk_meta['close']:.4f}  {name} ${brk_meta['ema']:.4f}\n"
-                                   f"距 EMA {brk_meta['dist_pct']:+.2f}%  实体 {brk_meta['body_pct']:.2f}%"),
-                        "icon": arrow,
-                    })
+        if len(k1d) >= 3 and _bar_just_closed(k1d[-2], now_ts, tolerance_sec=900):
+            groups, last_bar = _scan_emas_on_bar(k1d, EMA_CONFIG, is_daily=True)
+            for gk, hits in groups.items():
+                alert = _emit_ema_group(symbol, hits, gk, "1d", True, last_bar, state, dk)
+                if alert:
+                    alerts.append(alert)
     except Exception as e:
-        print(f"[ema_1d:{symbol}] error: {e}")
-
-    # ==== 日线 EMA50 穿越 ====
-    try:
-        k1d = klines(symbol, "1d", 100)
-        if len(k1d) >= 55:
-            closes_d = [float(k[4]) for k in k1d]
-            ema50_d = ema_series(closes_d, 50)
-
-            last_closed_d = k1d[-2]
-            if _bar_just_closed(last_closed_d, now_ts):
-                close_d = closes_d[-2]
-                prev_close_d = closes_d[-3]
-                e50 = ema50_d[-2]
-                e50_prev = ema50_d[-3]
-
-                if prev_close_d < e50_prev and close_d >= e50:
-                    key = f"ema50d_up:{symbol}:{dk}"
-                    if not already_fired(state, key):
-                        mark_fired(state, key)
-                        alerts.append({
-                            "kind": "ema_cross",
-                            "symbol": symbol,
-                            "text": "🌟🌟 日线收盘上穿 EMA50（大趋势转多）",
-                            "detail": f"收盘 ${close_d:.4f}  EMA50 ${e50:.4f}",
-                            "icon": "🚀",
-                        })
-                elif prev_close_d > e50_prev and close_d <= e50:
-                    key = f"ema50d_down:{symbol}:{dk}"
-                    if not already_fired(state, key):
-                        mark_fired(state, key)
-                        alerts.append({
-                            "kind": "ema_cross",
-                            "symbol": symbol,
-                            "text": "🌟🌟 日线收盘下穿 EMA50（大趋势转空）",
-                            "detail": f"收盘 ${close_d:.4f}  EMA50 ${e50:.4f}",
-                            "icon": "⚠️",
-                        })
-    except Exception as e:
-        print(f"[ema_1d:{symbol}] error: {e}")
+        print(f"[ema_1d:{symbol}] {e}")
 
     return alerts
 
