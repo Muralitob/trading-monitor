@@ -5,3 +5,6 @@ __pycache__/
 workers/.wrangler/
 workers/node_modules/
 state.json
+# 用户交易分析（含敏感 API 数据）
+analyze_trades.py
+trades_dump/
