@@ -71,14 +71,14 @@ RULES = {
 ALL_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT",   # 加密大盘 + SOL
     "HYPEUSDT",                        # 加密山寨
-    "XAUUSDT", "XAGUSDT",              # 黄金 + 白银
+    "XAUUSDT", "XAGUSDT", "COPPERUSDT",# 金 / 银 / 铜
     "SOXLUSDT", "KORUUSDT",            # 3x ETF
     "EWYUSDT",                         # 韩国 ETF
     "SKHYNIXUSDT", "SNDKUSDT",         # 半导体
     "MUUSDT",                          # 美光
 ]
 
-VOLATILITY_SYMBOLS = ["BTCUSDT", "ETHUSDT", "XAUUSDT", "XAGUSDT"]
+VOLATILITY_SYMBOLS = ["BTCUSDT", "ETHUSDT", "XAUUSDT", "XAGUSDT", "COPPERUSDT"]
 VOL_THRESHOLD = 0.03
 
 CHANNEL_SYMBOLS = ALL_SYMBOLS  # 通道识别应用到全部
