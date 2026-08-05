@@ -22,10 +22,10 @@ from monitor import (
 BASE = "https://fapi.binance.com"
 TOP_N = 100                    # 扫描前 N 热门币
 ALERT_N = 5                    # 每次推送前 N 异动
-OI_CHANGE_MIN = 3.0            # OI 变化门槛 %
-PRICE_CHANGE_MIN = 1.0         # 价格变化门槛 %
-PRICE_CHANGE_MAX = 8.0         # 价格变化上限（超过说明已经跑了大波，追不上）
-LOOKBACK_MIN = 15              # 回溯多少分钟
+OI_CHANGE_MIN = 1.5            # OI 变化门槛 %（5min 窗口比 15min 敏感，降低门槛）
+PRICE_CHANGE_MIN = 0.5         # 价格变化门槛 %
+PRICE_CHANGE_MAX = 5.0         # 价格变化上限
+LOOKBACK_MIN = 5               # 回溯 5 分钟
 
 
 def fetch_json(url, timeout=10):
@@ -47,8 +47,8 @@ def get_top_symbols():
     return perp[:TOP_N]
 
 
-def get_oi_history(symbol, period="5m", limit=4):
-    """拿 OI 历史数据，limit=4 = 15 分钟"""
+def get_oi_history(symbol, period="5m", limit=2):
+    """拿 OI 历史数据，limit=2 = 现在 + 5 分钟前"""
     url = f"{BASE}/futures/data/openInterestHist?symbol={symbol}&period={period}&limit={limit}"
     return fetch_json(url)
 
@@ -81,26 +81,22 @@ def scan():
         current_price = float(t["lastPrice"])
         vol_24h = float(t["quoteVolume"]) / 1e6  # 单位百万 USDT
 
-        oi_hist = get_oi_history(sym, "5m", 4)
-        if not oi_hist or len(oi_hist) < 3:
+        oi_hist = get_oi_history(sym, "5m", 2)
+        if not oi_hist or len(oi_hist) < 2:
             continue
 
         oi_now = float(oi_hist[-1]["sumOpenInterestValue"])
-        oi_past = float(oi_hist[0]["sumOpenInterestValue"])
+        oi_past = float(oi_hist[0]["sumOpenInterestValue"])  # 5 分钟前
         if oi_past == 0: continue
 
         oi_change = (oi_now - oi_past) / oi_past * 100
 
-        # 价格 15 分钟变化：用 OI 数据的对应时间价格
-        # 这里用最近价 vs 15min前价（从OI 历史推 15min 前的价格约等于 3根 5m 前的价格）
-        # 更精确：拉 5m K线
-        # 简化：用 24h priceChangePercent 的一小段近似
-        # 更好：直接拉 5m 3根
-        k5m = fetch_json(f"{BASE}/fapi/v1/klines?symbol={sym}&interval=5m&limit=4")
-        if not k5m or len(k5m) < 4:
+        # 价格 5 分钟变化
+        k5m = fetch_json(f"{BASE}/fapi/v1/klines?symbol={sym}&interval=5m&limit=2")
+        if not k5m or len(k5m) < 2:
             continue
-        price_15m_ago = float(k5m[0][4])  # 15 分钟前收盘价
-        price_change = (current_price - price_15m_ago) / price_15m_ago * 100
+        price_5m_ago = float(k5m[0][4])  # 5 分钟前收盘价
+        price_change = (current_price - price_5m_ago) / price_5m_ago * 100
 
         # 过滤
         if abs(oi_change) < OI_CHANGE_MIN:
@@ -143,7 +139,7 @@ def build_feishu_card(anomalies):
         symbol_short = a['symbol'].replace('USDT', '')
         lines.append(
             f"{a['icon']} **{symbol_short}** · {a['kind']} · **{a['direction']}**\n"
-            f"　现价 `${a['price']:.5g}`  ·  15minOI {oi_c}  ·  15min价格 {p_c}\n"
+            f"　现价 `${a['price']:.5g}`  ·  5minOI {oi_c}  ·  5min价格 {p_c}\n"
             f"　24h量 ${a['vol_24h_mm']:.1f}M  ·  成交量排名 #{a['rank']}"
         )
     lines.append(f"\n_{now.strftime('%m-%d %H:%M')} BJ · 每 5 分钟扫描_")
@@ -180,10 +176,12 @@ def main():
         print("无异动")
         return
 
-    # 去重：同一品种同方向 30 分钟内不重复推
+    # 去重：同一品种同方向 15 分钟内不重复推（5min 扫描 × 3）
     fresh = []
+    now = datetime.datetime.utcnow()
+    slot_15min = now.hour * 4 + now.minute // 15
     for a in anomalies:
-        key = f"oi:{a['symbol']}:{a['direction']}:{dk}:{datetime.datetime.utcnow().hour * 2 + datetime.datetime.utcnow().minute // 30}"
+        key = f"oi:{a['symbol']}:{a['direction']}:{dk}:{slot_15min}"
         if already_fired(state, key):
             continue
         mark_fired(state, key)
