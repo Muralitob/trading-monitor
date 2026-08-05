@@ -593,40 +593,65 @@ def _bar_just_closed(kline, now_ts, tolerance_sec=360):
 
 def _check_ema_rejection(k_bar, ema_val, min_wick_ratio=1.0):
     """
-    检测 EMA 拒绝形态（不只是碰，要有反应）
+    检测 EMA 拒绝形态（碰了但被拒绝）
     返回 ("SHORT", detail) / ("LONG", detail) / None
-
-    SHORT (拒绝上方 EMA)：
-      - 上影线 >= EMA（碰到）
-      - 实体主体在 EMA 下方（K 线主体没有站上 EMA）
-      - 上影线 >= 实体 × min_wick_ratio（拒绝够明显）
-
-    LONG (反弹下方 EMA)：
-      - 下影线 <= EMA
-      - 实体主体在 EMA 上方
-      - 下影线 >= 实体 × min_wick_ratio
     """
     o = float(k_bar[1]); h = float(k_bar[2]); l = float(k_bar[3]); c = float(k_bar[4])
     body_top = max(o, c)
     body_bottom = min(o, c)
     body = abs(c - o) or 0.0001
 
-    # SHORT: 冲上 EMA 后回落到 EMA 下方
+    # SHORT 拒绝：冲上 EMA 后 K线主体回落到 EMA 下方
     if h >= ema_val and body_top < ema_val:
         upper_wick = h - body_top
         if upper_wick >= body * min_wick_ratio:
-            return "SHORT", {
-                "upper_wick": upper_wick, "body": body,
-                "wick_ratio": upper_wick / body,
-            }
+            return "SHORT", {"wick_ratio": upper_wick / body}
 
-    # LONG: 下探 EMA 后弹回 EMA 上方
+    # LONG 反弹：下探 EMA 后 K线主体弹回 EMA 上方
     if l <= ema_val and body_bottom > ema_val:
         lower_wick = body_bottom - l
         if lower_wick >= body * min_wick_ratio:
-            return "LONG", {
-                "lower_wick": lower_wick, "body": body,
-                "wick_ratio": lower_wick / body,
+            return "LONG", {"wick_ratio": lower_wick / body}
+
+    return None, None
+
+
+def _check_ema_break(k_bar, prev_bar, ema_now, ema_prev, min_body_pct=0.003):
+    """
+    检测 EMA 突破形态（真的穿过去了）
+    返回 ("UP", detail) / ("DOWN", detail) / None
+
+    UP 突破（做多）：
+      - 上一根收盘 < 上一根 EMA
+      - 本根收盘 > 本根 EMA
+      - 本根实体 >= min_body_pct（避免小实体假突破）
+      - 本根收盘 > EMA 至少 0.1%（不是刚好压线）
+
+    DOWN 突破（做空）：
+      - 反向逻辑
+    """
+    o = float(k_bar[1]); c = float(k_bar[4])
+    prev_c = float(prev_bar[4])
+    body = abs(c - o)
+    body_pct = body / c if c else 0
+
+    # 上穿
+    if prev_c < ema_prev and c > ema_now:
+        # 实体够大 + 明确站上 EMA
+        if body_pct >= min_body_pct and (c - ema_now) / ema_now >= 0.001:
+            return "UP", {
+                "close": c, "ema": ema_now,
+                "dist_pct": (c - ema_now) / ema_now * 100,
+                "body_pct": body_pct * 100,
+            }
+
+    # 下破
+    if prev_c > ema_prev and c < ema_now:
+        if body_pct >= min_body_pct and (ema_now - c) / ema_now >= 0.001:
+            return "DOWN", {
+                "close": c, "ema": ema_now,
+                "dist_pct": (ema_now - c) / ema_now * 100,
+                "body_pct": body_pct * 100,
             }
 
     return None, None
@@ -648,85 +673,112 @@ def check_ema_signals(symbol, now_utc, state, dk):
         (200, "🌟🌟", "EMA200"),
     ]
 
-    # ==== 4H EMA 拒绝检测 ====
+    # ==== 4H EMA 拒绝 + 突破检测 ====
     try:
         k4h = klines(symbol, "4h", 250)
         if len(k4h) < 3: return alerts
 
         last_closed = k4h[-2]
-        if not _bar_just_closed(last_closed, now_ts, tolerance_sec=480):
-            pass  # 允许继续检查 1D
-        else:
+        if _bar_just_closed(last_closed, now_ts, tolerance_sec=480):
             closes = [float(k[4]) for k in k4h]
+            prev_bar = k4h[-3]
+
             for period, star, name in EMA_CONFIG:
                 if len(closes) < period + 5: continue
                 ema = ema_series(closes, period)
                 e_now = ema[-2]
+                e_prev = ema[-3]
 
+                # 拒绝形态
                 direction, meta = _check_ema_rejection(last_closed, e_now, min_wick_ratio=1.0)
-                if not direction: continue
+                if direction:
+                    key = f"ema_reject_4h:{name.lower()}:{direction}:{symbol}:{dk}"
+                    if not already_fired(state, key):
+                        mark_fired(state, key)
+                        dir_zh = "拒绝上方（做空）" if direction == "SHORT" else "反弹上方（做多）"
+                        close_p = float(last_closed[4])
+                        low = float(last_closed[3]); high = float(last_closed[2])
+                        alerts.append({
+                            "kind": "ema_reject", "symbol": symbol, "direction": direction,
+                            "text": f"{star + ' ' if star else ''}4H {name} · {dir_zh}",
+                            "detail": (f"收盘 ${close_p:.4f}  {name} ${e_now:.4f}\n"
+                                       f"影线 ${low:.4f}-${high:.4f}  拒绝比 {meta['wick_ratio']:.2f}"),
+                            "icon": "📊",
+                        })
 
-                key = f"ema_reject_4h:{name.lower()}:{direction}:{symbol}:{dk}"
-                if already_fired(state, key): continue
-                mark_fired(state, key)
-
-                dir_zh = "拒绝上方（做空）" if direction == "SHORT" else "反弹上方（做多）"
-                close_p = float(last_closed[4])
-                low = float(last_closed[3]); high = float(last_closed[2])
-                alerts.append({
-                    "kind": "ema_reject",
-                    "symbol": symbol,
-                    "direction": direction,
-                    "text": f"{star + ' ' if star else ''}4H {name} · {dir_zh}",
-                    "detail": (
-                        f"收盘 ${close_p:.4f}  {name} ${e_now:.4f}\n"
-                        f"影线 ${low:.4f}-${high:.4f}  拒绝影/实体比 {meta['wick_ratio']:.2f}"
-                    ),
-                    "icon": "📊",
-                })
+                # 突破形态
+                brk_dir, brk_meta = _check_ema_break(last_closed, prev_bar, e_now, e_prev)
+                if brk_dir:
+                    key = f"ema_break_4h:{name.lower()}:{brk_dir}:{symbol}:{dk}"
+                    if not already_fired(state, key):
+                        mark_fired(state, key)
+                        arrow = "🚀" if brk_dir == "UP" else "💥"
+                        dir_zh = "上穿（做多）" if brk_dir == "UP" else "下破（做空）"
+                        alerts.append({
+                            "kind": "ema_break", "symbol": symbol, "direction": brk_dir,
+                            "text": f"{star + ' ' if star else ''}{arrow} 4H {name} · {dir_zh}",
+                            "detail": (f"收盘 ${brk_meta['close']:.4f}  {name} ${brk_meta['ema']:.4f}\n"
+                                       f"距 EMA {brk_meta['dist_pct']:+.2f}%  实体 {brk_meta['body_pct']:.2f}%"),
+                            "icon": arrow,
+                        })
     except Exception as e:
-        print(f"[ema_reject_4h:{symbol}] error: {e}")
+        print(f"[ema_4h:{symbol}] error: {e}")
 
-    # ==== 1D EMA 拒绝检测 ====
+    # ==== 1D EMA 拒绝 + 突破检测 ====
     try:
         k1d = klines(symbol, "1d", 250)
         if len(k1d) < 3: return alerts
 
         last_closed_d = k1d[-2]
-        if not _bar_just_closed(last_closed_d, now_ts, tolerance_sec=900):  # 日线容差 15min
+        if not _bar_just_closed(last_closed_d, now_ts, tolerance_sec=900):
             return alerts
 
         closes_d = [float(k[4]) for k in k1d]
+        prev_bar_d = k1d[-3]
+
         for period, star, name in EMA_CONFIG:
             if len(closes_d) < period + 5: continue
             ema_d = ema_series(closes_d, period)
             e_now = ema_d[-2]
+            e_prev = ema_d[-3]
 
-            direction, meta = _check_ema_rejection(last_closed_d, e_now, min_wick_ratio=1.0)
-            if not direction: continue
-
-            key = f"ema_reject_1d:{name.lower()}:{direction}:{symbol}:{dk}"
-            if already_fired(state, key): continue
-            mark_fired(state, key)
-
-            # 日线信号级别升一档
+            # 日线信号升一档
             display_star = star + "🌟" if star else "🌟"
-            dir_zh = "拒绝上方（做空）" if direction == "SHORT" else "反弹上方（做多）"
-            close_p = float(last_closed_d[4])
-            low = float(last_closed_d[3]); high = float(last_closed_d[2])
-            alerts.append({
-                "kind": "ema_reject",
-                "symbol": symbol,
-                "direction": direction,
-                "text": f"{display_star} **1D {name} · {dir_zh}**",
-                "detail": (
-                    f"日线收盘 ${close_p:.4f}  {name} ${e_now:.4f}\n"
-                    f"影线 ${low:.4f}-${high:.4f}  拒绝影/实体比 {meta['wick_ratio']:.2f}"
-                ),
-                "icon": "🚀",
-            })
+
+            # 拒绝
+            direction, meta = _check_ema_rejection(last_closed_d, e_now, min_wick_ratio=1.0)
+            if direction:
+                key = f"ema_reject_1d:{name.lower()}:{direction}:{symbol}:{dk}"
+                if not already_fired(state, key):
+                    mark_fired(state, key)
+                    dir_zh = "拒绝上方（做空）" if direction == "SHORT" else "反弹上方（做多）"
+                    close_p = float(last_closed_d[4])
+                    low = float(last_closed_d[3]); high = float(last_closed_d[2])
+                    alerts.append({
+                        "kind": "ema_reject", "symbol": symbol, "direction": direction,
+                        "text": f"{display_star} **1D {name} · {dir_zh}**",
+                        "detail": (f"日线收盘 ${close_p:.4f}  {name} ${e_now:.4f}\n"
+                                   f"影线 ${low:.4f}-${high:.4f}  拒绝比 {meta['wick_ratio']:.2f}"),
+                        "icon": "🚀",
+                    })
+
+            # 突破（日线突破极其重要）
+            brk_dir, brk_meta = _check_ema_break(last_closed_d, prev_bar_d, e_now, e_prev)
+            if brk_dir:
+                key = f"ema_break_1d:{name.lower()}:{brk_dir}:{symbol}:{dk}"
+                if not already_fired(state, key):
+                    mark_fired(state, key)
+                    arrow = "🚀" if brk_dir == "UP" else "💥"
+                    dir_zh = "上穿（做多信号）" if brk_dir == "UP" else "下破（做空信号）"
+                    alerts.append({
+                        "kind": "ema_break", "symbol": symbol, "direction": brk_dir,
+                        "text": f"{display_star} {arrow} **1D {name} · {dir_zh}**",
+                        "detail": (f"日线收盘 ${brk_meta['close']:.4f}  {name} ${brk_meta['ema']:.4f}\n"
+                                   f"距 EMA {brk_meta['dist_pct']:+.2f}%  实体 {brk_meta['body_pct']:.2f}%"),
+                        "icon": arrow,
+                    })
     except Exception as e:
-        print(f"[ema_reject_1d:{symbol}] error: {e}")
+        print(f"[ema_1d:{symbol}] error: {e}")
 
     # ==== 日线 EMA50 穿越 ====
     try:
