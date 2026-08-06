@@ -1082,9 +1082,133 @@ def _compute_ema(values, period):
     return ema_series(values, period)
 
 
+def _build_narrative(sym, direction, hits):
+    """
+    把多个指标 hits 拼成"故事"，解释为什么这是个机会
+    例：4H 下降通道跌破后又回到通道内 → 假破位反弹信号 → 1H 收阳线确认 → 做多机会
+    """
+    parts = []
+
+    # 分类各种 hit
+    channel_hit = None
+    ema_hits = []
+    level_hits = []
+    retest_hits = []
+
+    for kind, payload in hits:
+        if kind == "channel":
+            channel_hit = payload
+        elif kind == "ema":
+            ema_hits.append(payload)
+        elif kind == "level":
+            level_hits.append(payload)
+        elif kind == "retest":
+            retest_hits.append(payload)
+
+    dir_zh_action = "做多" if direction == "LONG" else "做空"
+
+    # === 1. 通道故事 ===
+    if channel_hit:
+        ch = channel_hit["channel"]
+        ch_dir = ch["direction"]
+        touch_type = channel_hit["type"]
+        # 通道方向 + 触碰位置 + 顺逆势判断
+        if direction == "LONG" and touch_type == "触碰下沿":
+            if ch_dir == "上升通道":
+                parts.append(f"📐 **2H 上升通道**跌到**下沿**后止跌，属**顺势回调支撑**。")
+            elif ch_dir == "下降通道":
+                parts.append(f"📐 **2H 下降通道**跌到下沿虽然逆势，但**触点 {ch['touch_lower']} 次**说明该位置有效，可能出现反弹。")
+            else:
+                parts.append(f"📐 **2H 震荡区间**下沿附近，箱底做多。")
+        elif direction == "SHORT" and touch_type == "触碰上沿":
+            if ch_dir == "下降通道":
+                parts.append(f"📐 **2H 下降通道**冲高到**上沿**遇阻，**顺势做空首选**。")
+            elif ch_dir == "上升通道":
+                parts.append(f"📐 **2H 上升通道**冲到上沿，虽然逆势，但触点 {ch['touch_upper']} 次说明该位置有效，警惕短线回落。")
+            else:
+                parts.append(f"📐 **2H 震荡区间**上沿附近，箱顶做空。")
+
+    # === 2. EMA 故事 ===
+    if ema_hits:
+        # 按周期分组
+        h4_reject = [e for e in ema_hits if "4H" in e.get("text", "") and e.get("kind") == "ema_reject"]
+        h4_break = [e for e in ema_hits if "4H" in e.get("text", "") and e.get("kind") == "ema_break"]
+        d1_reject = [e for e in ema_hits if "1D" in e.get("text", "") and e.get("kind") == "ema_reject"]
+        d1_break = [e for e in ema_hits if "1D" in e.get("text", "") and e.get("kind") == "ema_break"]
+
+        # 日线突破是最大信号
+        if d1_break:
+            ema_names = " / ".join(_extract_ema_names(e) for e in d1_break)
+            action_zh = "站上" if direction == "LONG" else "跌破"
+            parts.append(f"🚀 **日线**已经{action_zh} **{ema_names}**（K 线主体真的穿过去了，不是插针），这是**大级别趋势转折**的确认。")
+
+        # 日线拒绝
+        if d1_reject:
+            ema_names = " / ".join(_extract_ema_names(e) for e in d1_reject)
+            action_zh = "反弹上方" if direction == "LONG" else "冲高受阻"
+            parts.append(f"🌟 **日线**在 **{ema_names}** 位置{action_zh}，K 线主体收回来了 → **大级别位置被守住**。")
+
+        # 4H 突破
+        if h4_break:
+            ema_names = " / ".join(_extract_ema_names(e) for e in h4_break)
+            action_zh = "站上" if direction == "LONG" else "跌破"
+            parts.append(f"⚡ **4H 已经{action_zh} {ema_names}**（主体真穿越），短期动能确认。")
+
+        # 4H 拒绝
+        if h4_reject:
+            ema_names = " / ".join(_extract_ema_names(e) for e in h4_reject)
+            if direction == "LONG":
+                parts.append(f"📊 **4H 下探 {ema_names} 后主体收回上方**，说明多头在这个位置进场护盘。")
+            else:
+                parts.append(f"📊 **4H 冲高触到 {ema_names} 后主体被压回下方**，说明空头在这个位置卖压强。")
+
+    # === 3. 关键位穿越 ===
+    if level_hits:
+        for lh in level_hits:
+            parts.append(f"🎯 关键位穿越：{lh}")
+
+    # === 4. 破位反抽 ===
+    if retest_hits:
+        for rh in retest_hits:
+            parts.append(f"🔻 破位反抽：{rh['type']} @ ${rh['level']}（先跌破再反弹到原支撑位试探）")
+
+    return "\n\n".join(parts)
+
+
+def _extract_ema_names(hit):
+    """从 hit 的 text 里抠出 EMA 名字（如 'EMA21 / EMA52'）"""
+    import re
+    text = hit.get("text", "")
+    m = re.findall(r"EMA\d+", text)
+    if m:
+        return " / ".join(m)
+    return "EMA"
+
+
+def _check_1h_confirmation(sym, direction):
+    """
+    1H 确认：最近一根 1H K 线方向是否支持 direction
+    返回 str 描述或空字符串
+    """
+    try:
+        k1h = klines(sym, "1h", 3)
+        last = k1h[-2]  # 已收盘
+        o = float(last[1]); c = float(last[4])
+        if direction == "LONG" and c > o:
+            change = (c - o) / o * 100
+            return f"✅ 1H 最新收盘 **阳线** ({change:+.2f}%)，方向与做多一致。"
+        elif direction == "SHORT" and c < o:
+            change = (c - o) / o * 100
+            return f"✅ 1H 最新收盘 **阴线** ({change:.2f}%)，方向与做空一致。"
+        else:
+            return f"⚠️ 1H 最新收盘方向与 {direction} 不一致，等更明确的 1H 反转再动手。"
+    except Exception:
+        return ""
+
+
 def _push_opportunity(sym, direction, board, market_context, stamp, chart_mod):
     """
-    把一个共振交易机会推送到 Telegram（附完整策略参数）
+    把一个共振交易机会推送到 Telegram（附完整策略参数 + 逻辑故事）
     """
     score = board["score"]
     hits = board["hits"]
@@ -1140,11 +1264,18 @@ def _push_opportunity(sym, direction, board, market_context, stamp, chart_mod):
     lines = [f"{tier_icon} **{sym}** · {dir_icon} **{dir_zh}** · 共振 {score} 分（{tier_zh}）"]
     lines.append("")
 
-    # 触发依据
-    lines.append("📋 **触发依据**")
-    for r in reasons:
-        lines.append(f"  · {r}")
-    lines.append("")
+    # === 完整逻辑故事 ===
+    narrative = _build_narrative(sym, direction, hits)
+    if narrative:
+        lines.append("🧠 **交易逻辑**")
+        lines.append(narrative)
+        lines.append("")
+
+    # === 1H 确认 ===
+    confirmation = _check_1h_confirmation(sym, direction)
+    if confirmation:
+        lines.append(confirmation)
+        lines.append("")
 
     # 策略参数
     if entry and stop and target:
