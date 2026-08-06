@@ -9,8 +9,27 @@ import sys, os, json, urllib.request, datetime, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from monitor import (
     _load_state, _save_state, already_fired, mark_fired, today_key,
-    send_tg,
+    CHAT_ID,
 )
+
+# 山寨榜专用 bot（跟主 bot 分开）
+ALT_TG_TOKEN = os.environ.get("ALT_TG_TOKEN", "").strip()
+
+
+def send_alt_tg(text):
+    """用山寨榜专属 bot 推送（如未配置则回退主 bot）"""
+    token = ALT_TG_TOKEN if ALT_TG_TOKEN else os.environ.get("TG_TOKEN", "")
+    if not token:
+        print("⚠️ ALT_TG_TOKEN 和 TG_TOKEN 都没设")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = json.dumps({
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+    }).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req, timeout=10).read()
 
 BASE = "https://fapi.binance.com"
 
@@ -152,8 +171,8 @@ def main():
     _save_state(state)
 
     try:
-        send_tg(text)
-        print("✓ 推送成功")
+        send_alt_tg(text)
+        print("✓ 推送成功（山寨榜专属 bot）")
     except Exception as e:
         print(f"推送失败: {e}")
 
