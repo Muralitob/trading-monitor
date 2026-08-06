@@ -236,14 +236,10 @@ def push_all(caption, photo_path=None):
         except Exception as e: print(f"[tg text] {e}")
         send_wecom_text(caption)
 
-    title = _extract_title(caption)
-
-    # 飞书推送（有 webhook 就推）
-    if FEISHU_WEBHOOK:
-        send_feishu(caption, title)
-
-    # PushPlus 已停用
-    # Bark 已停用（api.day.app 屏蔽 Cloudflare WARP 出口 IP）
+    # 飞书 / PushPlus / Bark 全部停用（用户 2026-08 决定：只走 Telegram）
+    # 如需恢复飞书，取消下面 2 行注释
+    # if FEISHU_WEBHOOK:
+    #     send_feishu(caption, _extract_title(caption))
 
 
 def send_tg_photo(caption, photo_path):
@@ -884,7 +880,80 @@ def main():
         print("No alerts triggered")
         return
 
-    # 尝试加载 chart 模块（VPS 需要 apt install python3-matplotlib）
+    # ============================================================
+    # 关键改造：不再单独推每个指标，而是按品种/方向汇总打分
+    # 达阈值才推 → 一条完整"交易机会"消息
+    # ============================================================
+    from collections import defaultdict
+    scoreboards = defaultdict(lambda: {"score": 0, "reasons": [], "meta": {}, "hits": []})
+
+    # 关键位穿越 (weight 25)
+    for kind, sym, price, desc, arrow in alerts:
+        if kind == "level":
+            direction = "LONG" if arrow == "⬆️" else "SHORT"
+            board = scoreboards[(sym, direction)]
+            board["score"] += 25
+            board["reasons"].append(f"关键位穿越 {desc}")
+            board["hits"].append(("level", desc))
+
+    # 通道触碰 (weight 35 + 交易 meta)
+    for ca in channel_alerts:
+        meta = ca.get("meta", {})
+        direction = meta.get("direction", "?")
+        if direction not in ("LONG", "SHORT"): continue
+        board = scoreboards[(ca["symbol"], direction)]
+        board["score"] += 35
+        board["reasons"].append(f"2H 通道 · {ca['type']}（{ca['channel']['direction']}）")
+        board["hits"].append(("channel", ca))
+        if "channel_meta" not in board["meta"]:
+            board["meta"]["channel_meta"] = meta
+            board["meta"]["channel_ch"] = ca["channel"]
+            board["meta"]["channel_price"] = ca["price"]
+
+    # EMA 拒绝/突破
+    for ea in ema_alerts:
+        direction = ea["direction"]
+        if direction not in ("LONG", "SHORT"): continue
+        # 权重：4H 无星=15，🌟=25；1D 无星=25，🌟=40，🌟🌟=50
+        star = ea.get("text", "")
+        is_1d = "1D" in star or "1d" in star.lower()
+        star_count = star.count("🌟")
+        if is_1d:
+            weight = {0: 25, 1: 40, 2: 50, 3: 60}.get(star_count, 25)
+        else:
+            weight = {0: 15, 1: 25, 2: 35}.get(star_count, 15)
+        board = scoreboards[(ea["symbol"], direction)]
+        board["score"] += weight
+        board["reasons"].append(ea["text"])
+        board["hits"].append(("ema", ea))
+
+    # 破位反抽 (weight 30)
+    for ra in retest_alerts:
+        direction = "SHORT" if "反抽" in ra["type"] else "LONG"
+        board = scoreboards[(ra["symbol"], direction)]
+        board["score"] += 30
+        board["reasons"].append(f"破位后 {ra['type']}（$${ra['level']}）")
+        board["hits"].append(("retest", ra))
+
+    # 大盘异动只当"背景"（不参与开单判断）
+    market_context = []
+    for kind, sym, price, desc, arrow in alerts:
+        if kind == "vol":
+            market_context.append(f"{arrow} {sym}: {desc}")
+
+    # 只保留 >= 40 分的机会
+    THRESHOLD = 40
+    opportunities = [
+        (key, board) for key, board in scoreboards.items()
+        if board["score"] >= THRESHOLD
+    ]
+    opportunities.sort(key=lambda x: -x[1]["score"])
+
+    if not opportunities:
+        print(f"No opportunity: {len(scoreboards)} signals but max score below {THRESHOLD}")
+        return
+
+    # 加载图表模块
     try:
         import chart as chart_mod
         CHART_ENABLED = True
@@ -893,6 +962,13 @@ def main():
         CHART_ENABLED = False
 
     stamp = now_utc.strftime("%m-%d %H:%M UTC")
+
+    # 推送每个交易机会
+    for (sym, direction), board in opportunities:
+        _push_opportunity(sym, direction, board, market_context, stamp, chart_mod if CHART_ENABLED else None)
+
+    print(f"Pushed {len(opportunities)} opportunities")
+    return  # 早返回，不再走后面单独推送逻辑
 
     # === 通道信号：一个信号一张图 + 完整交易参数 ===
     for ca in channel_alerts:
@@ -1004,6 +1080,112 @@ def main():
 def _compute_ema(values, period):
     """辅助：给主流程用的 EMA 计算（复用 ema_series）"""
     return ema_series(values, period)
+
+
+def _push_opportunity(sym, direction, board, market_context, stamp, chart_mod):
+    """
+    把一个共振交易机会推送到 Telegram（附完整策略参数）
+    """
+    score = board["score"]
+    hits = board["hits"]
+    reasons = board["reasons"]
+    meta = board["meta"]
+
+    # 分档
+    if score >= 80:
+        tier_icon = "🌟🌟🌟"
+        tier_zh = "高质量共振"
+    elif score >= 60:
+        tier_icon = "🌟🌟"
+        tier_zh = "多指标共振"
+    else:
+        tier_icon = "🌟"
+        tier_zh = "单指标信号"
+
+    dir_icon = "🟢" if direction == "LONG" else "🔴"
+    dir_zh = "做多 LONG" if direction == "LONG" else "做空 SHORT"
+
+    # ===== 计算策略参数 =====
+    # 优先用通道给的参数
+    entry = stop = target = rr = None
+    if meta.get("channel_meta"):
+        cm = meta["channel_meta"]
+        entry = cm["entry"]; stop = cm["stop"]; target = cm["target"]; rr = cm["rr"]
+        strategy_source = "通道结构"
+    else:
+        # 从 K 线动态算
+        try:
+            k4h = klines(sym, "4h", 30)
+            highs = [float(k[2]) for k in k4h]
+            lows = [float(k[3]) for k in k4h]
+            current = float(k4h[-1][4])
+            entry = current
+            if direction == "SHORT":
+                # 止损：最近 10 根 4H 高点 + 0.3%
+                stop = max(highs[-10:]) * 1.003
+                # 目标：最近 20 根 4H 低点
+                target = min(lows[-20:])
+            else:
+                stop = min(lows[-10:]) * 0.997
+                target = max(highs[-20:])
+            risk = abs(entry - stop)
+            reward = abs(target - entry)
+            rr = reward / risk if risk > 0 else 0
+            strategy_source = "近期极值"
+        except Exception as e:
+            print(f"[strategy:{sym}] {e}")
+            strategy_source = "无法计算"
+
+    # ===== 组装消息 =====
+    lines = [f"{tier_icon} **{sym}** · {dir_icon} **{dir_zh}** · 共振 {score} 分（{tier_zh}）"]
+    lines.append("")
+
+    # 触发依据
+    lines.append("📋 **触发依据**")
+    for r in reasons:
+        lines.append(f"  · {r}")
+    lines.append("")
+
+    # 策略参数
+    if entry and stop and target:
+        lines.append(f"🎯 **策略参数**（{strategy_source}）")
+        lines.append(f"  入场：`${entry:.4g}`")
+        lines.append(f"  止损：`${stop:.4g}`")
+        lines.append(f"  目标：`${target:.4g}`")
+        # RR 染色
+        rr_str = f"R:R = {rr:.2f}"
+        if rr < 1.5:
+            rr_str += " ⚠️ 偏低"
+        elif rr > 3:
+            rr_str += " ✅ 优秀"
+        lines.append(f"  盈亏比：{rr_str}")
+        lines.append("")
+
+    # 大盘背景
+    if market_context:
+        lines.append("🌍 大盘背景")
+        for c in market_context:
+            lines.append(f"  · {c}")
+        lines.append("")
+
+    lines.append(f"_{stamp} · 系统判断，最终决策看图确认_")
+
+    caption = "\n".join(lines)
+
+    # 出图（如果通道有 meta 就用通道图）
+    if chart_mod and meta.get("channel_ch"):
+        try:
+            k2h = klines(sym, "2h", 80)
+            png = chart_mod.chart_channel(sym, meta["channel_ch"], k2h)
+            push_all(caption, png)
+            try: os.remove(png)
+            except: pass
+            return
+        except Exception as e:
+            print(f"[chart:{sym}] {e}")
+
+    # 纯文本
+    push_all(caption)
 
 
 if __name__ == "__main__":
