@@ -1277,6 +1277,50 @@ def _push_opportunity(sym, direction, board, market_context, stamp, chart_mod):
         lines.append(confirmation)
         lines.append("")
 
+    # === 当前市场状态 ===
+    try:
+        k4h = klines(sym, "4h", 30)
+        highs = [float(k[2]) for k in k4h]
+        lows = [float(k[3]) for k in k4h]
+        closes_4h = [float(k[4]) for k in k4h]
+        current_price = closes_4h[-1]
+        support = min(lows[-30:])
+        resistance = max(highs[-30:])
+
+        lines.append("📊 **当前状态**")
+        lines.append(f"  💵 现价：`${current_price:.4g}`")
+        lines.append(f"  🟢 近30根支撑：`${support:.4g}`")
+        lines.append(f"  🔴 近30根压力：`${resistance:.4g}`")
+
+        # 计算 4H EMA 距离
+        ema_lines = []
+        for p, name in [(21, 'EMA21'), (52, 'EMA52'), (100, 'EMA100')]:
+            if len(closes_4h) >= p + 3:
+                ev = ema_series(closes_4h, p)[-1]
+                dist = (current_price - ev) / ev * 100
+                icon = "↑" if dist > 0 else "↓"
+                ema_lines.append(f"{name} `${ev:.4g}` {icon}{dist:+.2f}%")
+        if ema_lines:
+            lines.append(f"  📉 4H：{' · '.join(ema_lines)}")
+        lines.append("")
+    except Exception as e:
+        print(f"[status:{sym}] {e}")
+
+    # === 通道详情（如果有）===
+    if meta.get("channel_ch"):
+        ch = meta["channel_ch"]
+        cm = meta.get("channel_meta", {})
+        lines.append("📐 **通道结构**")
+        lines.append(f"  方向：{ch['direction']}  |  触点 {ch['touch_upper']}/{ch['touch_lower']}  |  R² {ch['r2_upper']:.2f}/{ch['r2_lower']:.2f}")
+        lines.append(f"  上沿 `${ch['upper']:.4g}` / 下沿 `${ch['lower']:.4g}`")
+        anchors_up = cm.get("anchors_up", [])
+        anchors_lo = cm.get("anchors_lo", [])
+        if anchors_up:
+            lines.append(f"  📍 上沿锚点：{'  →  '.join(anchors_up)}")
+        if anchors_lo:
+            lines.append(f"  📍 下沿锚点：{'  →  '.join(anchors_lo)}")
+        lines.append("")
+
     # 策略参数
     if entry and stop and target:
         lines.append(f"🎯 **策略参数**（{strategy_source}）")
@@ -1303,19 +1347,54 @@ def _push_opportunity(sym, direction, board, market_context, stamp, chart_mod):
 
     caption = "\n".join(lines)
 
-    # 出图（如果通道有 meta 就用通道图）
-    if chart_mod and meta.get("channel_ch"):
-        try:
-            k2h = klines(sym, "2h", 80)
-            png = chart_mod.chart_channel(sym, meta["channel_ch"], k2h)
-            push_all(caption, png)
-            try: os.remove(png)
-            except: pass
-            return
-        except Exception as e:
-            print(f"[chart:{sym}] {e}")
+    # ============= 出图 =============
+    if chart_mod:
+        # 优先通道图（信息最丰富）
+        if meta.get("channel_ch"):
+            try:
+                k2h = klines(sym, "2h", 80)
+                png = chart_mod.chart_channel(sym, meta["channel_ch"], k2h)
+                push_all(caption, png)
+                try: os.remove(png)
+                except: pass
+                return
+            except Exception as e:
+                print(f"[chart_channel:{sym}] {e}")
 
-    # 纯文本
+        # 有 EMA 信号 → 画 EMA 图
+        has_ema_hit = any(kind == "ema" for kind, _ in hits)
+        if has_ema_hit:
+            try:
+                # 判断 EMA 事件是发生在 4H 还是 1D
+                is_1d_signal = any("1D" in payload.get("text", "") for kind, payload in hits if kind == "ema")
+                interval = "1d" if is_1d_signal else "4h"
+                k_data = klines(sym, interval, 150)
+                closes_x = [float(k[4]) for k in k_data]
+                ema_short = ema_series(closes_x, 21) if len(closes_x) >= 21 else []
+                ema_long = ema_series(closes_x, 100) if len(closes_x) >= 100 else []
+                if ema_short and ema_long:
+                    # 找出信号里最重要的 EMA 名字
+                    ema_name = "EMA21"
+                    ema_val = ema_short[-2] if len(ema_short) >= 2 else 0
+                    for kind, payload in hits:
+                        if kind == "ema":
+                            for cand in ["EMA200", "EMA100", "EMA52", "EMA21", "EMA12"]:
+                                if cand in payload.get("text", ""):
+                                    ema_name = cand
+                                    period = int(cand.replace("EMA", ""))
+                                    if len(closes_x) >= period + 3:
+                                        ema_val = ema_series(closes_x, period)[-2]
+                                    break
+                    close_price = closes_x[-2]
+                    png = chart_mod.chart_ema_touch(sym, k_data, ema_short, ema_long, close_price, ema_name, ema_val)
+                    push_all(caption, png)
+                    try: os.remove(png)
+                    except: pass
+                    return
+            except Exception as e:
+                print(f"[chart_ema:{sym}] {e}")
+
+    # 兜底：纯文本
     push_all(caption)
 
 
