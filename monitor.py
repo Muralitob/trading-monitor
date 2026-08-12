@@ -1230,35 +1230,63 @@ def _push_opportunity(sym, direction, board, market_context, stamp, chart_mod):
     dir_zh = "做多 LONG" if direction == "LONG" else "做空 SHORT"
 
     # ===== 计算策略参数 =====
-    # 优先用通道给的参数
+    # 优先用通道给的参数（通道逻辑已经很好了）
     entry = stop = target = rr = None
     if meta.get("channel_meta"):
         cm = meta["channel_meta"]
         entry = cm["entry"]; stop = cm["stop"]; target = cm["target"]; rr = cm["rr"]
         strategy_source = "通道结构"
     else:
-        # 从 K 线动态算
+        # 智能算：止损=近 3 根极值 + 缓冲；目标=最近的 EMA/前高低点
         try:
-            k4h = klines(sym, "4h", 30)
+            k4h = klines(sym, "4h", 60)
             highs = [float(k[2]) for k in k4h]
             lows = [float(k[3]) for k in k4h]
-            current = float(k4h[-1][4])
+            closes_x = [float(k[4]) for k in k4h]
+            current = closes_x[-1]
             entry = current
-            if direction == "SHORT":
-                # 止损：最近 10 根 4H 高点 + 0.3%
-                stop = max(highs[-10:]) * 1.003
-                # 目标：最近 20 根 4H 低点
-                target = min(lows[-20:])
-            else:
-                stop = min(lows[-10:]) * 0.997
-                target = max(highs[-20:])
+
+            # 计算多条 EMA 值
+            ema_vals = {}
+            for p in [21, 52, 100, 200]:
+                if len(closes_x) >= p + 3:
+                    ema_vals[p] = ema_series(closes_x, p)[-1]
+
+            if direction == "LONG":
+                # 止损：最近 3 根 K 线最低点 - 0.3%
+                stop = min(lows[-3:]) * 0.997
+                # 目标：找上方最近的目标
+                candidates_above = []
+                for v in ema_vals.values():
+                    if v > current * 1.005:
+                        candidates_above.append(v)
+                recent_high = max(highs[-30:])
+                if recent_high > current * 1.005:
+                    candidates_above.append(recent_high)
+                target = min(candidates_above) if candidates_above else current * 1.03
+            else:  # SHORT
+                stop = max(highs[-3:]) * 1.003
+                candidates_below = []
+                for v in ema_vals.values():
+                    if v < current * 0.995:
+                        candidates_below.append(v)
+                recent_low = min(lows[-30:])
+                if recent_low < current * 0.995:
+                    candidates_below.append(recent_low)
+                target = max(candidates_below) if candidates_below else current * 0.97
+
             risk = abs(entry - stop)
             reward = abs(target - entry)
             rr = reward / risk if risk > 0 else 0
-            strategy_source = "近期极值"
+            strategy_source = "近3根止损 + 最近目标"
         except Exception as e:
             print(f"[strategy:{sym}] {e}")
             strategy_source = "无法计算"
+
+    # ===== R:R 太差直接不推 =====
+    if rr is not None and rr < 1.5:
+        print(f"[skip:{sym}] R:R {rr:.2f} < 1.5，放弃推送")
+        return
 
     # ===== 组装消息 =====
     lines = [f"{tier_icon} **{sym}** · {dir_icon} **{dir_zh}** · 共振 {score} 分（{tier_zh}）"]
