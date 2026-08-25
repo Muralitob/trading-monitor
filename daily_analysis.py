@@ -6,7 +6,7 @@ import sys, os, datetime, json, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from monitor import (
     klines, ema_series, detect_channel,
-    ALL_SYMBOLS, FEISHU_WEBHOOK,
+    ALL_SYMBOLS, FEISHU_WEBHOOK, TOKEN, CHAT_ID,
 )
 
 
@@ -302,6 +302,67 @@ def send_feishu_card(card):
     print(f"飞书响应: {resp}")
 
 
+def build_telegram_text(symbols_data):
+    """把预案转成 Telegram Markdown 文本（无卡片，纯文字）"""
+    now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    date_str = now.strftime("%m-%d %H:%M")
+
+    enabled_count = sum(1 for d, p in symbols_data if p["status"] == "启用")
+    triggered_count = sum(1 for d, p in symbols_data if p["status"] == "已触发")
+
+    lines = [f"📊 *每日交易预案 · {date_str} BJ*"]
+    lines.append(f"`━━━━━━━━━━━━━━━━━━━━`")
+    lines.append("")
+    lines.append(f"扫描 *{len(symbols_data)}* 个标的，{enabled_count} 启用，{triggered_count} 已触发")
+    lines.append("")
+
+    # 按状态排序
+    order = {"启用": 0, "已触发": 1, "观察": 2, "停用": 3}
+    symbols_data.sort(key=lambda x: (order.get(x[1]["status"], 99), x[0]["short"]))
+
+    for d, p in symbols_data:
+        chg = d["change_24h"]
+        chg_str = f"+{chg:.2f}%" if chg >= 0 else f"{chg:.2f}%"
+        chg_icon = "🟢" if chg >= 0 else "🔴"
+
+        if d["ema50d_dist"] > 3:
+            tag = "*[强多]*"
+        elif d["ema50d_dist"] < -3:
+            tag = "*[强空]*"
+        else:
+            tag = "*[震荡]*"
+
+        # 状态图标
+        st_icon = {"启用": "✅", "已触发": "🎯", "观察": "👀", "停用": "⏸"}.get(p["status"], "·")
+
+        lines.append(f"{st_icon} *{d['short']}* {tag}  {fmt(d['price'])}  {chg_icon} {chg_str}")
+
+        if p["direction"] != "WAIT":
+            dir_zh = "反弹空" if p["direction"] == "SHORT" else "回踩多"
+            lines.append(f"   {fmt(p['entry_low'])}-{fmt(p['entry_high'])} *{dir_zh}* · SL {fmt(p['sl'])} · R:R {p['rr']:.2f}")
+
+        state_desc = p['status']
+        if p["status_reason"]:
+            state_desc += f" ({p['status_reason']})"
+        lines.append(f"   状态：_{state_desc}_")
+        lines.append("")
+
+    lines.append("`━━━━━━━━━━━━━━━━━━━━`")
+    lines.append("_数据来自 Binance 永续 · 预案自动生成，仅供参考_")
+    return "\n".join(lines)
+
+
+def send_telegram(text):
+    if not TOKEN or not CHAT_ID:
+        print("⚠️ 未配置 TG_TOKEN/TG_CHAT")
+        return
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    data = json.dumps({"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    resp = urllib.request.urlopen(req, timeout=10).read().decode()
+    print(f"Telegram 响应: {resp[:200]}")
+
+
 def main():
     print("拉数据 + 生成预案中...")
     symbols_data = []
@@ -312,9 +373,19 @@ def main():
         p = build_plan(d)
         symbols_data.append((d, p))
 
-    card = build_card(symbols_data)
-    send_feishu_card(card)
-    print("✓ 已推送到飞书")
+    # 推 Telegram（主要通道）
+    text = build_telegram_text(symbols_data)
+    send_telegram(text)
+    print("✓ 已推送到 Telegram")
+
+    # 飞书作为可选备份（如果配置了）
+    if FEISHU_WEBHOOK:
+        try:
+            card = build_card(symbols_data)
+            send_feishu_card(card)
+            print("✓ 也推送到飞书")
+        except Exception as e:
+            print(f"飞书推送失败: {e}")
 
 
 if __name__ == "__main__":

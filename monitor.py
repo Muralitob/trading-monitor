@@ -798,16 +798,29 @@ def check_ema_signals(symbol, now_utc, state, dk):
 def main():
     now_utc = datetime.datetime.utcnow()
     bj_hour = (now_utc.hour + 8) % 24
+    bj_min = now_utc.minute
 
     if 0 <= bj_hour < 7:
         print(f"Quiet hours (BJ {bj_hour:02d}:xx), skipping")
         return
 
+    state = _load_state()
+    dk = today_key()
+
+    # 心跳：每 4 小时（BJ 8/12/16/20 点整分）发一次监控状态
+    if bj_hour in (8, 12, 16, 20) and bj_min == 0:
+        hb_key = f"heartbeat:{dk}:{bj_hour}"
+        if not already_fired(state, hb_key):
+            mark_fired(state, hb_key)
+            try:
+                send_tg(f"💓 监控心跳 · BJ {bj_hour}:00 · 系统运行中")
+            except Exception as e:
+                print(f"[heartbeat] {e}")
+            _save_state(state)
+
     alerts = []
 
     # 1. 关键位穿越（30 分钟滑动窗口 + 状态去重）
-    state = _load_state()
-    dk = today_key()
     for symbol, rules in RULES.items():
         try:
             # 拉最近 8 根 5m K线（40 分钟窗口）
@@ -941,8 +954,8 @@ def main():
         if kind == "vol":
             market_context.append(f"{arrow} {sym}: {desc}")
 
-    # 只保留 >= 40 分的机会
-    THRESHOLD = 40
+    # 阈值 25 分（单个中权重信号也推，避免全部被过滤）
+    THRESHOLD = 25
     opportunities = [
         (key, board) for key, board in scoreboards.items()
         if board["score"] >= THRESHOLD
@@ -1283,10 +1296,7 @@ def _push_opportunity(sym, direction, board, market_context, stamp, chart_mod):
             print(f"[strategy:{sym}] {e}")
             strategy_source = "无法计算"
 
-    # ===== R:R 太差直接不推 =====
-    if rr is not None and rr < 1.5:
-        print(f"[skip:{sym}] R:R {rr:.2f} < 1.5，放弃推送")
-        return
+    # R:R 不再强制过滤 — 只在消息里标 ⚠️ 让你自己看图判断
 
     # ===== 组装消息 =====
     lines = [f"{tier_icon} **{sym}** · {dir_icon} **{dir_zh}** · 共振 {score} 分（{tier_zh}）"]
