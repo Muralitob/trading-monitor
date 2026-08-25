@@ -55,30 +55,22 @@ def today_key():
 
 # 关键位规则：dir=up 从下向上触及（阻力）；dir=down 从上向下跌破（支撑）
 RULES = {
-    "HYPEUSDT": [
-        {"level": 58.0, "dir": "up",   "desc": "反弹到 58 阻力（做空关注区）"},
-        {"level": 60.0, "dir": "up",   "desc": "反弹到 60 关键阻力"},
-        {"level": 52.6, "dir": "down", "desc": "跌破 52.6 支撑（60日低点）"},
-    ],
-    "MUUSDT": [
-        {"level": 885.0, "dir": "up",   "desc": "反弹到 885 阻力区（做空关注）"},
-        {"level": 900.0, "dir": "up",   "desc": "反弹到 900 关键阻力"},
-        {"level": 835.0, "dir": "down", "desc": "跌破 835 支撑"},
-    ],
+    # 手动关键位：需要时再加，示例：
+    # "HYPEUSDT": [
+    #     {"level": 58.0, "dir": "up",   "desc": "..."},
+    # ],
 }
 
 # 所有关注的品种
 ALL_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT",   # 加密大盘 + SOL
-    "HYPEUSDT",                        # 加密山寨
-    "XAUUSDT", "XAGUSDT", "COPPERUSDT",# 金 / 银 / 铜
-    "SOXLUSDT", "KORUUSDT",            # 3x ETF
-    "EWYUSDT",                         # 韩国 ETF
-    "SKHYNIXUSDT", "SNDKUSDT",         # 半导体
-    "MUUSDT",                          # 美光
+    "ETHUSDT", "SOLUSDT",   # 主流
+    "HYPEUSDT", "XRPUSDT",  # 山寨大盘
+    "ZECUSDT",              # 隐私币
+    "UNIUSDT", "AAVEUSDT",  # DeFi
+    "XAUUSDT",              # 黄金
 ]
 
-VOLATILITY_SYMBOLS = ["BTCUSDT", "ETHUSDT", "XAUUSDT", "XAGUSDT", "COPPERUSDT"]
+VOLATILITY_SYMBOLS = ["ETHUSDT", "SOLUSDT", "XAUUSDT"]
 VOL_THRESHOLD = 0.03
 
 CHANNEL_SYMBOLS = ALL_SYMBOLS  # 通道识别应用到全部
