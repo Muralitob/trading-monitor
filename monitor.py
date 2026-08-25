@@ -63,14 +63,14 @@ RULES = {
 
 # 所有关注的品种
 ALL_SYMBOLS = [
-    "ETHUSDT", "SOLUSDT",   # 主流
-    "HYPEUSDT", "XRPUSDT",  # 山寨大盘
-    "ZECUSDT",              # 隐私币
-    "UNIUSDT", "AAVEUSDT",  # DeFi
-    "XAUUSDT",              # 黄金
+    "BTCUSDT", "ETHUSDT", "SOLUSDT",   # 主流
+    "HYPEUSDT", "XRPUSDT",             # 山寨大盘
+    "ZECUSDT",                         # 隐私币
+    "UNIUSDT", "AAVEUSDT",             # DeFi
+    "XAUUSDT",                         # 黄金
 ]
 
-VOLATILITY_SYMBOLS = ["ETHUSDT", "SOLUSDT", "XAUUSDT"]
+VOLATILITY_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XAUUSDT"]
 VOL_THRESHOLD = 0.03
 
 CHANNEL_SYMBOLS = ALL_SYMBOLS  # 通道识别应用到全部
