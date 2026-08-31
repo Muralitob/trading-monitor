@@ -1073,13 +1073,15 @@ def main():
         if kind == "vol":
             market_context.append(f"{arrow} {sym}: {desc}")
 
-    # 阈值 25 分（单个中权重信号也推，避免全部被过滤）
-    THRESHOLD = 25
+    # 阈值 45 分（要求共振）+ 每次最多推 top 2
+    THRESHOLD = 45
+    MAX_PUSH = 2
     opportunities = [
         (key, board) for key, board in scoreboards.items()
         if board["score"] >= THRESHOLD
     ]
     opportunities.sort(key=lambda x: -x[1]["score"])
+    opportunities = opportunities[:MAX_PUSH]
 
     if not opportunities:
         print(f"No opportunity: {len(scoreboards)} signals but max score below {THRESHOLD}")
