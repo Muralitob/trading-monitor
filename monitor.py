@@ -561,6 +561,113 @@ def check_retest(symbol, rules, state, dk, lookback_hours=24):
     return alerts
 
 
+# ==================== 支撑/压力翻转（S/R Flip）====================
+
+def _find_swings_simple(highs, lows, window=3):
+    """返回 [(idx, price, 'H'|'L')] 按 idx 升序"""
+    out = []
+    for i in range(window, len(highs) - window):
+        if all(highs[i] >= highs[i + j] for j in range(-window, window + 1) if j != 0):
+            out.append((i, highs[i], "H"))
+        if all(lows[i] <= lows[i + j] for j in range(-window, window + 1) if j != 0):
+            out.append((i, lows[i], "L"))
+    return out
+
+
+def check_sr_flip(symbol, state, dk):
+    """
+    自动 S/R Flip 检测（4H swing）：
+      - 找最近 60 根 4H 的 swing high / low
+      - swing high 若被 4H 收盘上破（且之后≥2根维持），成为"翻转支撑"
+      - 现价（5m）从上方回来试探该位置（±0.5%）→ LONG 机会
+      - 反过来同理 → SHORT
+    """
+    try:
+        k4h = klines(symbol, "4h", 80)
+        k5m = klines(symbol, "5m", 8)
+    except Exception as e:
+        print(f"[srflip:{symbol}] fetch: {e}")
+        return []
+    if len(k4h) < 30 or len(k5m) < 3:
+        return []
+
+    highs = [float(k[2]) for k in k4h]
+    lows = [float(k[3]) for k in k4h]
+    closes = [float(k[4]) for k in k4h]
+    current = float(k5m[-1][4])
+
+    # 用 window=3 找 swing（近 60 根）
+    swings = _find_swings_simple(highs, lows, window=3)
+    if not swings:
+        return []
+
+    alerts = []
+    last_idx = len(closes) - 1
+
+    # 只看最近 15 根内的 swing 突破（避免太老的价位）
+    for idx, level, kind in swings:
+        # 需要至少 3 根 K 线之后来判断突破
+        if idx > last_idx - 3:
+            continue
+        tol = level * 0.005
+
+        if kind == "H":
+            # 检查是否被向上突破：swing 之后有 K 线收盘 > level + tol
+            broke_up_idx = None
+            for j in range(idx + 1, last_idx + 1):
+                if closes[j] > level + tol:
+                    broke_up_idx = j
+                    break
+            if broke_up_idx is None:
+                continue
+            # 突破后至少 2 根维持在上方
+            stayed = sum(1 for j in range(broke_up_idx, last_idx + 1) if closes[j] > level - tol)
+            if stayed < 2:
+                continue
+            # 突破点到现在不能太老（<= 12 根 4H = 2 天内）
+            if last_idx - broke_up_idx > 12:
+                continue
+            # 现价是否在回踩：从上方回到 level±tol
+            if level - tol <= current <= level + tol and closes[-1] > level:
+                key = f"srflip_up:{symbol}:{round(level, 6)}:{dk}"
+                if not already_fired(state, key):
+                    mark_fired(state, key)
+                    alerts.append({
+                        "symbol": symbol, "kind": "sr_flip",
+                        "direction": "LONG",
+                        "level": level, "price": current,
+                        "text": f"4H 突破前压力 ${level:.4g} 后回踩 → 压力翻转支撑",
+                        "detail": f"突破点 {last_idx - broke_up_idx} 根前，之后 {stayed} 根维持上方",
+                    })
+        else:
+            # swing low：被向下跌破 → 支撑翻转压力
+            broke_dn_idx = None
+            for j in range(idx + 1, last_idx + 1):
+                if closes[j] < level - tol:
+                    broke_dn_idx = j
+                    break
+            if broke_dn_idx is None:
+                continue
+            stayed = sum(1 for j in range(broke_dn_idx, last_idx + 1) if closes[j] < level + tol)
+            if stayed < 2:
+                continue
+            if last_idx - broke_dn_idx > 12:
+                continue
+            if level - tol <= current <= level + tol and closes[-1] < level:
+                key = f"srflip_dn:{symbol}:{round(level, 6)}:{dk}"
+                if not already_fired(state, key):
+                    mark_fired(state, key)
+                    alerts.append({
+                        "symbol": symbol, "kind": "sr_flip",
+                        "direction": "SHORT",
+                        "level": level, "price": current,
+                        "text": f"4H 跌破前支撑 ${level:.4g} 后反抽 → 支撑翻转压力",
+                        "detail": f"跌破点 {last_idx - broke_dn_idx} 根前，之后 {stayed} 根维持下方",
+                    })
+
+    return alerts
+
+
 # ==================== EMA 检测 ====================
 
 def ema_series(values, period):
@@ -880,10 +987,18 @@ def main():
     for symbol, rules in RULES.items():
         retest_alerts.extend(check_retest(symbol, rules, state, dk))
 
+    # 6. S/R Flip 自动检测（4H swing）
+    srflip_alerts = []
+    for symbol in ALL_SYMBOLS:
+        try:
+            srflip_alerts.extend(check_sr_flip(symbol, state, dk))
+        except Exception as e:
+            print(f"[srflip:{symbol}] {e}")
+
     # 保存去重状态
     _save_state(state)
 
-    if not alerts and not channel_alerts and not ema_alerts and not retest_alerts:
+    if not alerts and not channel_alerts and not ema_alerts and not retest_alerts and not srflip_alerts:
         print("No alerts triggered")
         return
 
@@ -935,6 +1050,14 @@ def main():
         board["score"] += weight
         board["reasons"].append(ea["text"])
         board["hits"].append(("ema", ea))
+
+    # S/R Flip 自动检测 (weight 40：跟通道差不多重)
+    for sf in srflip_alerts:
+        direction = sf["direction"]
+        board = scoreboards[(sf["symbol"], direction)]
+        board["score"] += 40
+        board["reasons"].append(sf["text"])
+        board["hits"].append(("srflip", sf))
 
     # 破位反抽 (weight 30)
     for ra in retest_alerts:
@@ -1103,6 +1226,7 @@ def _build_narrative(sym, direction, hits):
     ema_hits = []
     level_hits = []
     retest_hits = []
+    srflip_hits = []
 
     for kind, payload in hits:
         if kind == "channel":
@@ -1113,6 +1237,8 @@ def _build_narrative(sym, direction, hits):
             level_hits.append(payload)
         elif kind == "retest":
             retest_hits.append(payload)
+        elif kind == "srflip":
+            srflip_hits.append(payload)
 
     dir_zh_action = "做多" if direction == "LONG" else "做空"
 
@@ -1176,6 +1302,13 @@ def _build_narrative(sym, direction, hits):
     if level_hits:
         for lh in level_hits:
             parts.append(f"🎯 关键位穿越：{lh}")
+
+    # === S/R 翻转（自动） ===
+    for sf in srflip_hits:
+        if sf["direction"] == "LONG":
+            parts.append(f"🔄 **4H 突破前压力 ${sf['level']:.4g} 后回踩** → 压力已经翻转成支撑，回来试探成功=**做多**。\n   _{sf['detail']}_")
+        else:
+            parts.append(f"🔄 **4H 跌破前支撑 ${sf['level']:.4g} 后反抽** → 支撑已经翻转成压力，反抽到位=**做空**。\n   _{sf['detail']}_")
 
     # === 4. 破位反抽 ===
     if retest_hits:
