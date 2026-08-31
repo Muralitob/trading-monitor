@@ -405,9 +405,9 @@ def _anchor_str(k2h, idx, price):
         return f"${price:.4g}"
 
 
-def check_channel(symbol, state, dk):
+def check_channel(symbol, state, dk, timeframe="2h"):
     """检查 symbol 是否触碰通道边界，返回 alert dict 或 None（带状态去重）"""
-    k2h = klines(symbol, "2h", 200)
+    k2h = klines(symbol, timeframe, 200)
     ch = detect_channel(k2h)
     if not ch:
         return None
@@ -466,7 +466,7 @@ def check_channel(symbol, state, dk):
 
         # 触碰下沿
         if lower - tol <= curr_c <= lower + tol and prev_c > lower + tol:
-            key = f"channel_lower:{symbol}:{dk}"
+            key = f"channel_lower_{timeframe}:{symbol}:{dk}"
             if not already_fired(state, key):
                 mark_fired(state, key)
                 sig = "做多关注" if ch["direction"] == "上升通道" else "反弹关注（**逆势，谨慎**）"
@@ -474,6 +474,7 @@ def check_channel(symbol, state, dk):
                 return {
                     "symbol": symbol, "type": "触碰下沿", "channel": ch,
                     "price": current, "signal": sig, "meta": meta,
+                    "timeframe": timeframe, "k_bars": k2h,
                 }
 
     # 触碰上沿
@@ -481,7 +482,7 @@ def check_channel(symbol, state, dk):
         prev_c = float(k5m[i-1][4])
         curr_c = float(k5m[i][4])
         if upper - tol <= curr_c <= upper + tol and prev_c < upper - tol:
-            key = f"channel_upper:{symbol}:{dk}"
+            key = f"channel_upper_{timeframe}:{symbol}:{dk}"
             if not already_fired(state, key):
                 mark_fired(state, key)
                 sig = "做空关注" if ch["direction"] == "下降通道" else "回落关注（**逆势，谨慎**）"
@@ -489,6 +490,7 @@ def check_channel(symbol, state, dk):
                 return {
                     "symbol": symbol, "type": "触碰上沿", "channel": ch,
                     "price": current, "signal": sig, "meta": meta,
+                    "timeframe": timeframe, "k_bars": k2h,
                 }
 
     return None
@@ -858,15 +860,16 @@ def main():
         except Exception as e:
             print(f"[vol:{symbol}] error: {e}")
 
-    # 3. 通道识别
+    # 3. 通道识别（2H + 4H）
     channel_alerts = []
     for symbol in CHANNEL_SYMBOLS:
-        try:
-            ca = check_channel(symbol, state, dk)
-            if ca:
-                channel_alerts.append(ca)
-        except Exception as e:
-            print(f"[channel:{symbol}] error: {e}")
+        for tf in ("2h", "4h"):
+            try:
+                ca = check_channel(symbol, state, dk, timeframe=tf)
+                if ca:
+                    channel_alerts.append(ca)
+            except Exception as e:
+                print(f"[channel:{symbol}:{tf}] error: {e}")
 
     # 4. EMA 触碰 / 穿越
     ema_alerts = []
@@ -901,19 +904,24 @@ def main():
             board["reasons"].append(f"关键位穿越 {desc}")
             board["hits"].append(("level", desc))
 
-    # 通道触碰 (weight 35 + 交易 meta)
+    # 通道触碰 (weight: 2H=35, 4H=45 更重)
     for ca in channel_alerts:
         meta = ca.get("meta", {})
         direction = meta.get("direction", "?")
         if direction not in ("LONG", "SHORT"): continue
+        tf = ca.get("timeframe", "2h").upper()
+        weight = 45 if tf == "4H" else 35
         board = scoreboards[(ca["symbol"], direction)]
-        board["score"] += 35
-        board["reasons"].append(f"2H 通道 · {ca['type']}（{ca['channel']['direction']}）")
+        board["score"] += weight
+        board["reasons"].append(f"{tf} 通道 · {ca['type']}（{ca['channel']['direction']}）")
         board["hits"].append(("channel", ca))
-        if "channel_meta" not in board["meta"]:
+        # 优先用 4H 通道做图和策略参数
+        if "channel_meta" not in board["meta"] or (tf == "4H" and board["meta"].get("channel_tf") != "4H"):
             board["meta"]["channel_meta"] = meta
             board["meta"]["channel_ch"] = ca["channel"]
             board["meta"]["channel_price"] = ca["price"]
+            board["meta"]["channel_tf"] = tf
+            board["meta"]["channel_kbars"] = ca.get("k_bars")
 
     # EMA 拒绝/突破
     for ea in ema_alerts:
@@ -1117,21 +1125,22 @@ def _build_narrative(sym, direction, hits):
         ch = channel_hit["channel"]
         ch_dir = ch["direction"]
         touch_type = channel_hit["type"]
+        tf = channel_hit.get("timeframe", "2h").upper()
         # 通道方向 + 触碰位置 + 顺逆势判断
         if direction == "LONG" and touch_type == "触碰下沿":
             if ch_dir == "上升通道":
-                parts.append(f"📐 **2H 上升通道**跌到**下沿**后止跌，属**顺势回调支撑**。")
+                parts.append(f"📐 **{tf} 上升通道**跌到**下沿**后止跌，属**顺势回调支撑**。")
             elif ch_dir == "下降通道":
-                parts.append(f"📐 **2H 下降通道**跌到下沿虽然逆势，但**触点 {ch['touch_lower']} 次**说明该位置有效，可能出现反弹。")
+                parts.append(f"📐 **{tf} 下降通道**跌到下沿虽然逆势，但**触点 {ch['touch_lower']} 次**说明该位置有效，可能出现反弹。")
             else:
-                parts.append(f"📐 **2H 震荡区间**下沿附近，箱底做多。")
+                parts.append(f"📐 **{tf} 震荡区间**下沿附近，箱底做多。")
         elif direction == "SHORT" and touch_type == "触碰上沿":
             if ch_dir == "下降通道":
-                parts.append(f"📐 **2H 下降通道**冲高到**上沿**遇阻，**顺势做空首选**。")
+                parts.append(f"📐 **{tf} 下降通道**冲高到**上沿**遇阻，**顺势做空首选**。")
             elif ch_dir == "上升通道":
-                parts.append(f"📐 **2H 上升通道**冲到上沿，虽然逆势，但触点 {ch['touch_upper']} 次说明该位置有效，警惕短线回落。")
+                parts.append(f"📐 **{tf} 上升通道**冲到上沿，虽然逆势，但触点 {ch['touch_upper']} 次说明该位置有效，警惕短线回落。")
             else:
-                parts.append(f"📐 **2H 震荡区间**上沿附近，箱顶做空。")
+                parts.append(f"📐 **{tf} 震荡区间**上沿附近，箱顶做空。")
 
     # === 2. EMA 故事 ===
     if ema_hits:
@@ -1382,8 +1391,9 @@ def _push_opportunity(sym, direction, board, market_context, stamp, chart_mod):
         # 优先通道图（信息最丰富）
         if meta.get("channel_ch"):
             try:
-                k2h = klines(sym, "2h", 80)
-                png = chart_mod.chart_channel(sym, meta["channel_ch"], k2h)
+                tf = meta.get("channel_tf", "2H")
+                k_bars = klines(sym, tf.lower(), 80)
+                png = chart_mod.chart_channel(sym, meta["channel_ch"], k_bars, timeframe=tf)
                 push_all(caption, png)
                 try: os.remove(png)
                 except: pass

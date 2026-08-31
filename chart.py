@@ -20,6 +20,44 @@ BLUE = "#4A90E2"
 YELLOW = "#f5c542"
 ORANGE = "#ff9800"
 
+# 全套 EMA 配色（画在所有图上）
+EMA_STYLES = [
+    (12,  "#9E9E9E", "EMA12",  0.7, 0.9),   # 灰
+    (21,  "#f5c542", "EMA21",  0.9, 1.0),   # 黄
+    (52,  "#4A90E2", "EMA52",  1.0, 1.1),   # 蓝
+    (100, "#ff9800", "EMA100", 1.0, 1.2),   # 橙
+    (200, "#e91e63", "EMA200", 1.0, 1.4),   # 粉红
+]
+
+
+def _ema(values, period):
+    if not values or len(values) < period:
+        return []
+    k = 2 / (period + 1)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+
+def _overlay_all_emas(ax, klines_data, highlight_name=None):
+    """在给定 ax 上叠画全套 EMA。highlight_name 会加粗突出显示。"""
+    closes = [float(k[4]) for k in klines_data]
+    n = len(closes)
+    xs = list(range(n))
+    for period, color, name, alpha, lw in EMA_STYLES:
+        if n < period + 1:
+            continue
+        series = _ema(closes, period)
+        line_w = lw + 0.6 if name == highlight_name else lw
+        line_alpha = 1.0 if name == highlight_name else alpha
+        ax.plot(xs, series, color=color, linewidth=line_w, alpha=line_alpha, label=name)
+        # 右端标签
+        ax.annotate(f"{name} {series[-1]:.4g}", xy=(n - 1, series[-1]),
+                    xytext=(5, 0), textcoords="offset points",
+                    color=color, fontsize=7.5,
+                    fontweight="bold" if name == highlight_name else "normal")
+
 
 def _style(ax):
     ax.set_facecolor(BG)
@@ -45,18 +83,19 @@ def _draw_candles(ax, klines_data, offset=0):
         ))
 
 
-def chart_channel(symbol, ch, klines_2h, out_dir=None):
+def chart_channel(symbol, ch, klines_2h, out_dir=None, timeframe="2H"):
     """
     绘制 2H 通道图
     ch: detect_channel 返回的 dict，包含 direction/upper/lower/slope_upper/slope_lower
     返回 png 文件路径
     """
     n = len(klines_2h)
-    fig, ax = plt.subplots(figsize=(10, 5.5), dpi=90)
+    fig, ax = plt.subplots(figsize=(11, 6), dpi=90)
     fig.patch.set_facecolor(BG)
     _style(ax)
 
     _draw_candles(ax, klines_2h)
+    _overlay_all_emas(ax, klines_2h)
 
     # 通道线：反推 intercept，画出上下沿及延伸
     us = ch["slope_upper"]
@@ -89,7 +128,7 @@ def chart_channel(symbol, ch, klines_2h, out_dir=None):
 
     # 标题
     dir_en = {"下降通道":"FALLING CHANNEL","上升通道":"RISING CHANNEL","水平通道":"FLAT CHANNEL"}.get(ch["direction"], ch["direction"])
-    title = f"{symbol}  2H  {dir_en}   touch {ch['touch_upper']}/{ch['touch_lower']}  R^2 {ch['r2_upper']:.2f}/{ch['r2_lower']:.2f}"
+    title = f"{symbol}  {timeframe}  {dir_en}   touch {ch['touch_upper']}/{ch['touch_lower']}  R^2 {ch['r2_upper']:.2f}/{ch['r2_lower']:.2f}"
     ax.set_title(title, color=TEXT, fontsize=10, loc="left")
 
     # X 轴用时间
@@ -99,44 +138,37 @@ def chart_channel(symbol, ch, klines_2h, out_dir=None):
     ax.set_xticks(xticks)
     ax.set_xticklabels([times[i].strftime("%m-%d %H:%M") for i in xticks], rotation=0)
 
-    ax.set_xlim(-1, n + 3)
+    ax.set_xlim(-1, n + 8)
+    ax.legend(loc="upper left", facecolor=BG, edgecolor=GRID, labelcolor=TEXT, fontsize=7, ncol=5)
     plt.tight_layout()
 
     out_dir = out_dir or tempfile.gettempdir()
-    out_path = os.path.join(out_dir, f"chart_channel_{symbol}_{int(datetime.datetime.utcnow().timestamp())}.png")
+    out_path = os.path.join(out_dir, f"chart_channel_{symbol}_{timeframe}_{int(datetime.datetime.utcnow().timestamp())}.png")
     plt.savefig(out_path, facecolor=BG, edgecolor="none", bbox_inches="tight")
     plt.close(fig)
     return out_path
 
 
-def chart_ema_touch(symbol, klines_4h, ema25, ema100, close_price, ema_name, ema_val, out_dir=None):
-    """绘制 4H EMA 触碰图"""
+def chart_ema_touch(symbol, klines_4h, ema25, ema100, close_price, ema_name, ema_val, out_dir=None, timeframe="4H"):
+    """绘制 EMA 触碰/突破图（叠画全套 EMA）"""
     n = len(klines_4h)
-    show_n = min(80, n)  # 只画最近 80 根
+    show_n = min(120, n)  # 画最近 120 根，让 EMA200 也能有值
     kdata = klines_4h[-show_n:]
-    e25 = ema25[-show_n:]
-    e100 = ema100[-show_n:]
 
-    fig, ax = plt.subplots(figsize=(10, 5.5), dpi=90)
+    fig, ax = plt.subplots(figsize=(11, 6), dpi=90)
     fig.patch.set_facecolor(BG)
     _style(ax)
     _draw_candles(ax, kdata)
+    _overlay_all_emas(ax, kdata, highlight_name=ema_name)
 
-    xs = list(range(show_n))
-    ax.plot(xs, e25, color=YELLOW, linewidth=1.2, label="EMA25", alpha=0.9)
-    ax.plot(xs, e100, color=ORANGE, linewidth=1.4, label="EMA100", alpha=0.9)
-
-    # 高亮触碰点
-    highlight_color = YELLOW if ema_name == "EMA25" else ORANGE
-    ax.axhline(y=ema_val, color=highlight_color, linewidth=0.6, linestyle=":", alpha=0.5)
-    ax.annotate(f"{ema_name} {ema_val:.4g}", xy=(show_n - 1, ema_val),
-                xytext=(5, 5), textcoords="offset points",
-                color=highlight_color, fontsize=9, fontweight="bold")
+    # 高亮触碰的 EMA
+    highlight_color = next((c for p, c, n_, a, l in EMA_STYLES if n_ == ema_name), YELLOW)
+    ax.axhline(y=ema_val, color=highlight_color, linewidth=0.7, linestyle=":", alpha=0.6)
     ax.annotate(f"close {close_price:.4g}", xy=(show_n - 1, close_price),
-                xytext=(5, -10), textcoords="offset points",
-                color=TEXT, fontsize=9)
+                xytext=(5, -12), textcoords="offset points",
+                color=TEXT, fontsize=9, fontweight="bold")
 
-    title = f"{symbol}  4H  touching {ema_name}"
+    title = f"{symbol}  {timeframe}  touching {ema_name}"
     ax.set_title(title, color=TEXT, fontsize=10, loc="left")
 
     times = [datetime.datetime.utcfromtimestamp(int(k[0]) / 1000) for k in kdata]
@@ -144,9 +176,9 @@ def chart_ema_touch(symbol, klines_4h, ema25, ema100, close_price, ema_name, ema
     xticks = list(range(0, show_n, step))
     ax.set_xticks(xticks)
     ax.set_xticklabels([times[i].strftime("%m-%d %H:%M") for i in xticks])
-    ax.set_xlim(-1, show_n + 3)
+    ax.set_xlim(-1, show_n + 8)
 
-    ax.legend(loc="upper left", facecolor=BG, edgecolor=GRID, labelcolor=TEXT, fontsize=8)
+    ax.legend(loc="upper left", facecolor=BG, edgecolor=GRID, labelcolor=TEXT, fontsize=7, ncol=5)
     plt.tight_layout()
 
     out_dir = out_dir or tempfile.gettempdir()
