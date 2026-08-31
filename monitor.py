@@ -860,16 +860,15 @@ def main():
         except Exception as e:
             print(f"[vol:{symbol}] error: {e}")
 
-    # 3. 通道识别（2H + 4H）
+    # 3. 通道识别（只跑 4H）
     channel_alerts = []
     for symbol in CHANNEL_SYMBOLS:
-        for tf in ("2h", "4h"):
-            try:
-                ca = check_channel(symbol, state, dk, timeframe=tf)
-                if ca:
-                    channel_alerts.append(ca)
-            except Exception as e:
-                print(f"[channel:{symbol}:{tf}] error: {e}")
+        try:
+            ca = check_channel(symbol, state, dk, timeframe="4h")
+            if ca:
+                channel_alerts.append(ca)
+        except Exception as e:
+            print(f"[channel:{symbol}:4h] error: {e}")
 
     # 4. EMA 触碰 / 穿越
     ema_alerts = []
@@ -904,24 +903,21 @@ def main():
             board["reasons"].append(f"关键位穿越 {desc}")
             board["hits"].append(("level", desc))
 
-    # 通道触碰 (weight: 2H=35, 4H=45 更重)
+    # 通道触碰 (4H, weight 45)
     for ca in channel_alerts:
         meta = ca.get("meta", {})
         direction = meta.get("direction", "?")
         if direction not in ("LONG", "SHORT"): continue
-        tf = ca.get("timeframe", "2h").upper()
-        weight = 45 if tf == "4H" else 35
+        tf = ca.get("timeframe", "4h").upper()
         board = scoreboards[(ca["symbol"], direction)]
-        board["score"] += weight
+        board["score"] += 45
         board["reasons"].append(f"{tf} 通道 · {ca['type']}（{ca['channel']['direction']}）")
         board["hits"].append(("channel", ca))
-        # 优先用 4H 通道做图和策略参数
-        if "channel_meta" not in board["meta"] or (tf == "4H" and board["meta"].get("channel_tf") != "4H"):
+        if "channel_meta" not in board["meta"]:
             board["meta"]["channel_meta"] = meta
             board["meta"]["channel_ch"] = ca["channel"]
             board["meta"]["channel_price"] = ca["price"]
             board["meta"]["channel_tf"] = tf
-            board["meta"]["channel_kbars"] = ca.get("k_bars")
 
     # EMA 拒绝/突破
     for ea in ema_alerts:
