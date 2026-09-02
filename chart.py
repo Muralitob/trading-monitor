@@ -188,6 +188,71 @@ def chart_ema_touch(symbol, klines_4h, ema25, ema100, close_price, ema_name, ema
     return out_path
 
 
+def chart_pattern(symbol, pattern, klines_4h, out_dir=None):
+    """绘制形态突破图（三角/楔形/矩形）"""
+    show_n = min(100, len(klines_4h))
+    kdata = klines_4h[-show_n:]
+    n = len(kdata)
+    offset = len(klines_4h) - n  # 原始 index 到新 index 的偏移
+
+    fig, ax = plt.subplots(figsize=(11, 6), dpi=90)
+    fig.patch.set_facecolor(BG)
+    _style(ax)
+    _draw_candles(ax, kdata)
+    _overlay_all_emas(ax, kdata)
+
+    # 画形态上下沿（用原始拟合线，转到新 index 上）
+    us = pattern["slope_upper"]; ui = pattern["up_int"]
+    ls = pattern["slope_lower"]; li = pattern["lo_int"]
+    # 原坐标 idx_orig → 新坐标 idx_new = idx_orig - offset
+    xs = list(range(0, n + 3))
+    upper_line = [us * (x + offset) + ui for x in xs]
+    lower_line = [ls * (x + offset) + li for x in xs]
+
+    # 只画形态存在的那段（更清晰）
+    start_new = max(0, pattern["start_idx"] - offset)
+    end_new = min(n - 1, max(p[0] for p in pattern["upper_pts"] + pattern["lower_pts"]) - offset)
+    seg_xs = list(range(start_new, end_new + 8))
+    seg_upper = [us * (x + offset) + ui for x in seg_xs]
+    seg_lower = [ls * (x + offset) + li for x in seg_xs]
+    ax.plot(seg_xs, seg_upper, color=BLUE, linewidth=1.6, alpha=0.9)
+    ax.plot(seg_xs, seg_lower, color=BLUE, linewidth=1.6, alpha=0.9)
+
+    # 标注 swing 触点
+    for idx, price, _kind in pattern["upper_pts"]:
+        new_x = idx - offset
+        if 0 <= new_x < n:
+            ax.plot(new_x, price, "o", color=RED, markersize=5)
+    for idx, price, _kind in pattern["lower_pts"]:
+        new_x = idx - offset
+        if 0 <= new_x < n:
+            ax.plot(new_x, price, "o", color=GREEN, markersize=5)
+
+    # 标签
+    ax.annotate(f"UP {pattern['upper']:.4g}", xy=(n - 1, pattern["upper"]),
+                xytext=(5, 5), textcoords="offset points", color=BLUE, fontsize=9)
+    ax.annotate(f"DN {pattern['lower']:.4g}", xy=(n - 1, pattern["lower"]),
+                xytext=(5, -12), textcoords="offset points", color=BLUE, fontsize=9)
+
+    title = f"{symbol}  4H  {pattern['name_en']}   R^2 {pattern['r2_upper']:.2f}/{pattern['r2_lower']:.2f}"
+    ax.set_title(title, color=TEXT, fontsize=10, loc="left")
+
+    times = [datetime.datetime.utcfromtimestamp(int(k[0]) / 1000) for k in kdata]
+    step = max(1, n // 8)
+    xticks = list(range(0, n, step))
+    ax.set_xticks(xticks)
+    ax.set_xticklabels([times[i].strftime("%m-%d %H:%M") for i in xticks])
+    ax.set_xlim(-1, n + 8)
+    ax.legend(loc="upper left", facecolor=BG, edgecolor=GRID, labelcolor=TEXT, fontsize=7, ncol=5)
+    plt.tight_layout()
+
+    out_dir = out_dir or tempfile.gettempdir()
+    out_path = os.path.join(out_dir, f"chart_pattern_{symbol}_{int(datetime.datetime.utcnow().timestamp())}.png")
+    plt.savefig(out_path, facecolor=BG, edgecolor="none", bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 def chart_level(symbol, klines_data, level, current_price, desc="", out_dir=None):
     """绘制关键位穿越 / 破位反抽 图（用 5m 数据）"""
     n = len(klines_data)

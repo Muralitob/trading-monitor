@@ -561,6 +561,175 @@ def check_retest(symbol, rules, state, dk, lookback_hours=24):
     return alerts
 
 
+# ==================== 形态识别（三角/楔形/矩形）====================
+
+def _classify_slope(slope, ref_price, n_bars):
+    """按整段总位移百分比分类"""
+    if ref_price == 0:
+        return 'flat'
+    total_move_pct = abs(slope * n_bars / ref_price)
+    if total_move_pct < 0.015:  # 全段 < 1.5% ≈ 水平
+        return 'flat'
+    return 'up' if slope > 0 else 'down'
+
+
+def _pattern_from_slopes(up_type, dn_type, us, ls):
+    """按上下沿方向判定形态"""
+    if up_type == 'flat' and dn_type == 'up':
+        return ('上升三角', 'LONG', 'ASC-TRIANGLE')
+    if up_type == 'down' and dn_type == 'flat':
+        return ('下降三角', 'SHORT', 'DESC-TRIANGLE')
+    if up_type == 'down' and dn_type == 'up':
+        return ('对称三角', 'TREND', 'SYM-TRIANGLE')
+    if up_type == 'flat' and dn_type == 'flat':
+        return ('矩形', 'TREND', 'RECT')
+    if up_type == 'up' and dn_type == 'up':
+        # 上升楔形：下沿升得更快（收敛向上）→ 反转向下
+        if ls > us * 1.3:
+            return ('上升楔形', 'SHORT', 'RISING-WEDGE')
+    if up_type == 'down' and dn_type == 'down':
+        # 下降楔形：上沿跌得更快（收敛向下）→ 反转向上
+        if us < ls * 1.3:
+            return ('下降楔形', 'LONG', 'FALLING-WEDGE')
+    return None
+
+
+def detect_pattern(k4h):
+    """在 4H K 线上找最佳形态。返回 dict 或 None"""
+    if len(k4h) < 30:
+        return None
+    highs = [float(k[2]) for k in k4h]
+    lows = [float(k[3]) for k in k4h]
+    closes = [float(k[4]) for k in k4h]
+    n = len(k4h)
+    cur_price = closes[-1]
+
+    best = None
+    for window in (2, 3, 4):
+        sh, sl = find_swings(highs, lows, window=window)
+        for nu in (5, 4, 3):
+            for nl in (5, 4, 3):
+                if len(sh) < nu or len(sl) < nl:
+                    continue
+                upper_pts = sh[-nu:]
+                lower_pts = sl[-nl:]
+                all_idx = [p[0] for p in upper_pts + lower_pts]
+                span = max(all_idx) - min(all_idx)
+                if span < 15 or span > 50:
+                    continue
+                # 形态结束点必须在最近 5 根内
+                if n - 1 - max(all_idx) > 5:
+                    continue
+
+                u = fit_line(upper_pts)
+                l = fit_line(lower_pts)
+                if not u or not l:
+                    continue
+                us, ui, ur2 = u
+                ls, li, lr2 = l
+                if ur2 < 0.65 or lr2 < 0.65:
+                    continue
+
+                up_type = _classify_slope(us, cur_price, span)
+                dn_type = _classify_slope(ls, cur_price, span)
+                pat = _pattern_from_slopes(up_type, dn_type, us, ls)
+                if not pat:
+                    continue
+
+                cur_idx = n - 1
+                upper_now = us * cur_idx + ui
+                lower_now = ls * cur_idx + li
+                if upper_now <= lower_now:
+                    continue
+                # 现价在形态附近
+                if cur_price < lower_now * 0.9 or cur_price > upper_now * 1.1:
+                    continue
+
+                score = ur2 * lr2 * (len(upper_pts) + len(lower_pts))
+                if best is None or score > best['_score']:
+                    best = {
+                        '_score': score,
+                        'name_cn': pat[0],
+                        'direction': pat[1],
+                        'name_en': pat[2],
+                        'upper': upper_now, 'lower': lower_now,
+                        'slope_upper': us, 'slope_lower': ls,
+                        'up_int': ui, 'lo_int': li,
+                        'r2_upper': ur2, 'r2_lower': lr2,
+                        'upper_pts': upper_pts, 'lower_pts': lower_pts,
+                        'span': span,
+                        'start_idx': min(all_idx),
+                    }
+    return best
+
+
+def check_pattern_breakout(symbol, state, dk):
+    """检测 4H 形态突破。返回 alert dict 或 None"""
+    try:
+        k4h = klines(symbol, "4h", 100)
+    except Exception as e:
+        print(f"[pattern:{symbol}] fetch: {e}")
+        return None
+    if len(k4h) < 30:
+        return None
+    pat = detect_pattern(k4h)
+    if not pat:
+        return None
+
+    # 用刚收盘的 4H 判断突破
+    last = k4h[-2]
+    prev = k4h[-3]
+    c = float(last[4]); o = float(last[1])
+    prev_c = float(prev[4])
+    n_last = len(k4h) - 2  # last closed 的 index
+
+    us = pat['slope_upper']; ui = pat['up_int']
+    ls = pat['slope_lower']; li = pat['lo_int']
+    upper_at = us * n_last + ui
+    lower_at = ls * n_last + li
+    body_pct = abs(c - o) / c if c else 0
+
+    direction = pat['direction']
+    # 对称三角/矩形 → 按前趋势判断
+    if direction == 'TREND':
+        start = pat['start_idx']
+        pre_lo = max(0, start - 15)
+        if start - pre_lo < 5:
+            return None
+        pre_closes = [float(k[4]) for k in k4h[pre_lo:start]]
+        direction = 'LONG' if pre_closes[-1] > pre_closes[0] else 'SHORT'
+
+    # 突破判定
+    signal = False
+    if direction == 'LONG':
+        if c > upper_at and prev_c <= upper_at * 1.002 and body_pct >= 0.004:
+            signal = True
+    else:
+        if c < lower_at and prev_c >= lower_at * 0.998 and body_pct >= 0.004:
+            signal = True
+
+    if not signal:
+        return None
+
+    key = f"pattern:{pat['name_en']}:{symbol}:{dk}"
+    if already_fired(state, key):
+        return None
+    mark_fired(state, key)
+
+    return {
+        'symbol': symbol,
+        'kind': 'pattern_break',
+        'pattern_cn': pat['name_cn'],
+        'pattern_en': pat['name_en'],
+        'direction': direction,
+        'price': c,
+        'upper': upper_at,
+        'lower': lower_at,
+        'pattern_data': pat,
+        'text': f"4H {pat['name_cn']} 突破 → {'做多' if direction == 'LONG' else '做空'}",
+    }
+
+
 # ==================== 支撑/压力翻转（S/R Flip）====================
 
 def _find_swings_simple(highs, lows, window=3):
@@ -995,10 +1164,20 @@ def main():
         except Exception as e:
             print(f"[srflip:{symbol}] {e}")
 
+    # 7. 形态突破（4H 三角/楔形/矩形）
+    pattern_alerts = []
+    for symbol in ALL_SYMBOLS:
+        try:
+            pa = check_pattern_breakout(symbol, state, dk)
+            if pa:
+                pattern_alerts.append(pa)
+        except Exception as e:
+            print(f"[pattern:{symbol}] {e}")
+
     # 保存去重状态
     _save_state(state)
 
-    if not alerts and not channel_alerts and not ema_alerts and not retest_alerts and not srflip_alerts:
+    if not alerts and not channel_alerts and not ema_alerts and not retest_alerts and not srflip_alerts and not pattern_alerts:
         print("No alerts triggered")
         return
 
@@ -1050,6 +1229,14 @@ def main():
         board["score"] += weight
         board["reasons"].append(ea["text"])
         board["hits"].append(("ema", ea))
+
+    # 形态突破 (weight 50：形态突破本身是很强的信号)
+    for pa in pattern_alerts:
+        direction = pa["direction"]
+        board = scoreboards[(pa["symbol"], direction)]
+        board["score"] += 50
+        board["reasons"].append(pa["text"])
+        board["hits"].append(("pattern", pa))
 
     # S/R Flip 自动检测 (weight 40：跟通道差不多重)
     for sf in srflip_alerts:
@@ -1229,6 +1416,7 @@ def _build_narrative(sym, direction, hits):
     level_hits = []
     retest_hits = []
     srflip_hits = []
+    pattern_hits = []
 
     for kind, payload in hits:
         if kind == "channel":
@@ -1241,6 +1429,8 @@ def _build_narrative(sym, direction, hits):
             retest_hits.append(payload)
         elif kind == "srflip":
             srflip_hits.append(payload)
+        elif kind == "pattern":
+            pattern_hits.append(payload)
 
     dir_zh_action = "做多" if direction == "LONG" else "做空"
 
@@ -1304,6 +1494,13 @@ def _build_narrative(sym, direction, hits):
     if level_hits:
         for lh in level_hits:
             parts.append(f"🎯 关键位穿越：{lh}")
+
+    # === 形态突破 ===
+    for ph in pattern_hits:
+        pd = ph["pattern_data"]
+        side = "向上" if ph["direction"] == "LONG" else "向下"
+        parts.append(f"🔺 **4H {ph['pattern_cn']}** 形态识别成功（{pd['span']} 根 K 线，R² {pd['r2_upper']:.2f}/{pd['r2_lower']:.2f}），"
+                     f"刚刚**{side}收盘突破** `${ph['price']:.4g}`，上沿 `${ph['upper']:.4g}` / 下沿 `${ph['lower']:.4g}`。")
 
     # === S/R 翻转（自动） ===
     for sf in srflip_hits:
@@ -1519,7 +1716,20 @@ def _push_opportunity(sym, direction, board, market_context, stamp, chart_mod):
 
     # ============= 出图 =============
     if chart_mod:
-        # 优先通道图（信息最丰富）
+        # 优先形态突破图
+        pattern_hit_for_chart = next((p for k, p in hits if k == "pattern"), None)
+        if pattern_hit_for_chart:
+            try:
+                k4h = klines(sym, "4h", 100)
+                png = chart_mod.chart_pattern(sym, pattern_hit_for_chart["pattern_data"], k4h)
+                push_all(caption, png)
+                try: os.remove(png)
+                except: pass
+                return
+            except Exception as e:
+                print(f"[chart_pattern:{sym}] {e}")
+
+        # 次优先：通道图
         if meta.get("channel_ch"):
             try:
                 tf = meta.get("channel_tf", "2H")
