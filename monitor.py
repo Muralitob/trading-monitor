@@ -663,12 +663,12 @@ def detect_pattern(k4h):
     return best
 
 
-def check_pattern_breakout(symbol, state, dk):
-    """检测 4H 形态突破。返回 alert dict 或 None"""
+def check_pattern_breakout(symbol, state, dk, timeframe="4h"):
+    """检测形态突破。返回 alert dict 或 None"""
     try:
-        k4h = klines(symbol, "4h", 100)
+        k4h = klines(symbol, timeframe, 100)
     except Exception as e:
-        print(f"[pattern:{symbol}] fetch: {e}")
+        print(f"[pattern:{symbol}:{timeframe}] fetch: {e}")
         return None
     if len(k4h) < 30:
         return None
@@ -711,7 +711,8 @@ def check_pattern_breakout(symbol, state, dk):
     if not signal:
         return None
 
-    key = f"pattern:{pat['name_en']}:{symbol}:{dk}"
+    tf_up = timeframe.upper()
+    key = f"pattern:{tf_up}:{pat['name_en']}:{symbol}:{dk}"
     if already_fired(state, key):
         return None
     mark_fired(state, key)
@@ -719,6 +720,7 @@ def check_pattern_breakout(symbol, state, dk):
     return {
         'symbol': symbol,
         'kind': 'pattern_break',
+        'timeframe': tf_up,
         'pattern_cn': pat['name_cn'],
         'pattern_en': pat['name_en'],
         'direction': direction,
@@ -726,7 +728,7 @@ def check_pattern_breakout(symbol, state, dk):
         'upper': upper_at,
         'lower': lower_at,
         'pattern_data': pat,
-        'text': f"4H {pat['name_cn']} 突破 → {'做多' if direction == 'LONG' else '做空'}",
+        'text': f"{tf_up} {pat['name_cn']} 突破 → {'做多' if direction == 'LONG' else '做空'}",
     }
 
 
@@ -1164,15 +1166,16 @@ def main():
         except Exception as e:
             print(f"[srflip:{symbol}] {e}")
 
-    # 7. 形态突破（4H 三角/楔形/矩形）
+    # 7. 形态突破（1H 短线 + 4H 主）
     pattern_alerts = []
     for symbol in ALL_SYMBOLS:
-        try:
-            pa = check_pattern_breakout(symbol, state, dk)
-            if pa:
-                pattern_alerts.append(pa)
-        except Exception as e:
-            print(f"[pattern:{symbol}] {e}")
+        for tf in ("1h", "4h"):
+            try:
+                pa = check_pattern_breakout(symbol, state, dk, timeframe=tf)
+                if pa:
+                    pattern_alerts.append(pa)
+            except Exception as e:
+                print(f"[pattern:{symbol}:{tf}] {e}")
 
     # 保存去重状态
     _save_state(state)
@@ -1230,11 +1233,13 @@ def main():
         board["reasons"].append(ea["text"])
         board["hits"].append(("ema", ea))
 
-    # 形态突破 (weight 50：形态突破本身是很强的信号)
+    # 形态突破 (4H=50 主力,1H=30 短线)
     for pa in pattern_alerts:
         direction = pa["direction"]
+        tf = pa.get("timeframe", "4H")
+        weight = 30 if tf == "1H" else 50
         board = scoreboards[(pa["symbol"], direction)]
-        board["score"] += 50
+        board["score"] += weight
         board["reasons"].append(pa["text"])
         board["hits"].append(("pattern", pa))
 
@@ -1499,7 +1504,8 @@ def _build_narrative(sym, direction, hits):
     for ph in pattern_hits:
         pd = ph["pattern_data"]
         side = "向上" if ph["direction"] == "LONG" else "向下"
-        parts.append(f"🔺 **4H {ph['pattern_cn']}** 形态识别成功（{pd['span']} 根 K 线，R² {pd['r2_upper']:.2f}/{pd['r2_lower']:.2f}），"
+        tf = ph.get("timeframe", "4H")
+        parts.append(f"🔺 **{tf} {ph['pattern_cn']}** 形态识别成功（{pd['span']} 根 K 线，R² {pd['r2_upper']:.2f}/{pd['r2_lower']:.2f}），"
                      f"刚刚**{side}收盘突破** `${ph['price']:.4g}`，上沿 `${ph['upper']:.4g}` / 下沿 `${ph['lower']:.4g}`。")
 
     # === S/R 翻转（自动） ===
@@ -1717,11 +1723,15 @@ def _push_opportunity(sym, direction, board, market_context, stamp, chart_mod):
     # ============= 出图 =============
     if chart_mod:
         # 优先形态突破图
-        pattern_hit_for_chart = next((p for k, p in hits if k == "pattern"), None)
+        # 优先 4H 形态，其次 1H
+        pattern_hits_all = [p for k, p in hits if k == "pattern"]
+        pattern_hits_all.sort(key=lambda p: 0 if p.get("timeframe") == "4H" else 1)
+        pattern_hit_for_chart = pattern_hits_all[0] if pattern_hits_all else None
         if pattern_hit_for_chart:
             try:
-                k4h = klines(sym, "4h", 100)
-                png = chart_mod.chart_pattern(sym, pattern_hit_for_chart["pattern_data"], k4h)
+                p_tf = pattern_hit_for_chart.get("timeframe", "4H").lower()
+                k4h = klines(sym, p_tf, 100)
+                png = chart_mod.chart_pattern(sym, pattern_hit_for_chart["pattern_data"], k4h, timeframe=p_tf.upper())
                 push_all(caption, png)
                 try: os.remove(png)
                 except: pass

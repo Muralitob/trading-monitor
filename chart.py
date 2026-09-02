@@ -188,7 +188,7 @@ def chart_ema_touch(symbol, klines_4h, ema25, ema100, close_price, ema_name, ema
     return out_path
 
 
-def chart_pattern(symbol, pattern, klines_4h, out_dir=None):
+def chart_pattern(symbol, pattern, klines_4h, out_dir=None, timeframe="4H"):
     """绘制形态突破图（三角/楔形/矩形）"""
     show_n = min(100, len(klines_4h))
     kdata = klines_4h[-show_n:]
@@ -234,7 +234,7 @@ def chart_pattern(symbol, pattern, klines_4h, out_dir=None):
     ax.annotate(f"DN {pattern['lower']:.4g}", xy=(n - 1, pattern["lower"]),
                 xytext=(5, -12), textcoords="offset points", color=BLUE, fontsize=9)
 
-    title = f"{symbol}  4H  {pattern['name_en']}   R^2 {pattern['r2_upper']:.2f}/{pattern['r2_lower']:.2f}"
+    title = f"{symbol}  {timeframe}  {pattern['name_en']}   R^2 {pattern['r2_upper']:.2f}/{pattern['r2_lower']:.2f}"
     ax.set_title(title, color=TEXT, fontsize=10, loc="left")
 
     times = [datetime.datetime.utcfromtimestamp(int(k[0]) / 1000) for k in kdata]
