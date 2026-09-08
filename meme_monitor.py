@@ -6,11 +6,13 @@ Bruce Ma 战法：Anchored VWAP × POC 双共振买点
 买点 = 现价同时靠近 (从24h高点锚定的 VWAP) 和 (24h 成交量 POC)
       + 最近 1h 没在崩盘
 """
-import os, sys, json, urllib.request, urllib.parse, datetime, time
+import os, sys, json, urllib.request, urllib.parse, datetime, time, uuid, tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from monitor import _load_state, _save_state, already_fired, mark_fired, today_key, CHAT_ID
 
 CG_BASE = "https://api.coingecko.com/api/v3"
+# 优先用 MEME_TG_TOKEN（My_Trader bot），没配就 fallback 到 alt bot
+MEME_TG_TOKEN = os.environ.get("MEME_TG_TOKEN", "").strip()
 ALT_TG_TOKEN = os.environ.get("ALT_TG_TOKEN", "").strip()
 
 # 过滤门槛
@@ -134,7 +136,111 @@ def analyze(coin):
         "poc": poc,
         "vwap_dist_pct": vwap_dist,
         "poc_dist_pct": poc_dist,
+        "_prices": prices,
+        "_volumes": volumes,
+        "_hi_idx": hi_idx,
     }
+
+
+def draw_chart(sig):
+    """画 24h 价格 + VWAP + POC + 成交量分布"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    BG = "#131722"; GRID = "#1e222d"; TEXT = "#d1d4dc"
+    GREEN = "#26a69a"; RED = "#ef5350"; YELLOW = "#f5c542"; BLUE = "#4A90E2"; ORANGE = "#ff9800"
+
+    prices = sig["_prices"]
+    volumes = sig["_volumes"]
+    hi_idx = sig["_hi_idx"]
+    vwap = sig["vwap"]; poc = sig["poc"]; cur = sig["price"]
+
+    xs = list(range(len(prices)))
+    ys = [p for _, p in prices]
+
+    # 时间标签
+    times = [datetime.datetime.utcfromtimestamp(t / 1000) + datetime.timedelta(hours=8) for t, _ in prices]
+
+    fig, (ax, ax_vp) = plt.subplots(1, 2, figsize=(12, 6), dpi=90,
+                                     gridspec_kw={"width_ratios": [4, 1], "wspace": 0.02})
+    fig.patch.set_facecolor(BG)
+    for a in (ax, ax_vp):
+        a.set_facecolor(BG)
+        a.tick_params(colors=TEXT, labelsize=8)
+        a.grid(True, color=GRID, linewidth=0.5, alpha=0.5)
+        for sp in a.spines.values():
+            sp.set_color(GRID)
+
+    # 主图：价格线
+    ax.plot(xs, ys, color=BLUE, linewidth=1.5, alpha=0.9, label="Price")
+
+    # 从 hi_idx 开始的 anchored VWAP 线（每一点重新计算）
+    cum_pv = 0.0; cum_v = 0.0
+    vwap_line = [None] * len(prices)
+    for i in range(hi_idx, len(prices)):
+        p = prices[i][1]
+        v = volumes[i][1] if i < len(volumes) else 0
+        cum_pv += p * v
+        cum_v += v
+        if cum_v > 0:
+            vwap_line[i] = cum_pv / cum_v
+    valid_x = [x for x in xs if vwap_line[x] is not None]
+    valid_y = [vwap_line[x] for x in valid_x]
+    ax.plot(valid_x, valid_y, color=YELLOW, linewidth=1.6, label=f"aVWAP {vwap:.4g}")
+
+    # 锚点标记
+    ax.axvline(x=hi_idx, color=RED, linewidth=0.6, linestyle=":", alpha=0.6)
+    ax.annotate("anchor (24h high)", xy=(hi_idx, prices[hi_idx][1]),
+                xytext=(3, 5), textcoords="offset points",
+                color=RED, fontsize=8)
+
+    # POC 水平线
+    ax.axhline(y=poc, color=ORANGE, linewidth=1.4, linestyle="--", alpha=0.9, label=f"POC {poc:.4g}")
+
+    # 现价
+    ax.axhline(y=cur, color=GREEN, linewidth=0.8, linestyle="-", alpha=0.6)
+    ax.annotate(f"NOW {cur:.4g}", xy=(len(xs) - 1, cur),
+                xytext=(5, 0), textcoords="offset points",
+                color=GREEN, fontsize=9, fontweight="bold")
+
+    # X 轴时间
+    n = len(xs)
+    step = max(1, n // 8)
+    xticks = list(range(0, n, step))
+    ax.set_xticks(xticks)
+    ax.set_xticklabels([times[i].strftime("%H:%M") for i in xticks], color=TEXT)
+    ax.set_xlim(0, n + 4)
+
+    ax.set_title(f"{sig['symbol']} · {sig['name']} · 24h · VWAP × POC",
+                 color=TEXT, fontsize=10, loc="left")
+    ax.legend(loc="upper right", facecolor=BG, edgecolor=GRID, labelcolor=TEXT, fontsize=8)
+
+    # 右侧：成交量分布直方图
+    p_min = min(ys); p_max = max(ys)
+    bins = 30
+    bw = (p_max - p_min) / bins if p_max > p_min else 1
+    buckets = [0.0] * bins
+    for i, (_, p) in enumerate(prices):
+        v = volumes[i][1] if i < len(volumes) else 0
+        b = min(int((p - p_min) / bw), bins - 1)
+        buckets[b] += v
+    y_centers = [p_min + (i + 0.5) * bw for i in range(bins)]
+    # 高亮 POC 所在的 bin
+    top_b = max(range(bins), key=lambda i: buckets[i])
+    colors = [ORANGE if i == top_b else BLUE for i in range(bins)]
+    ax_vp.barh(y_centers, buckets, height=bw * 0.9, color=colors, alpha=0.75)
+    ax_vp.set_ylim(ax.get_ylim())
+    ax_vp.set_xticks([])
+    ax_vp.set_yticks([])
+    ax_vp.set_title("Volume", color=TEXT, fontsize=8, loc="left")
+
+    plt.tight_layout()
+    out_path = os.path.join(tempfile.gettempdir(),
+                             f"meme_{sig['symbol']}_{int(datetime.datetime.utcnow().timestamp())}.png")
+    plt.savefig(out_path, facecolor=BG, edgecolor="none", bbox_inches="tight")
+    plt.close(fig)
+    return out_path
 
 
 def fmt_num(v):
@@ -166,14 +272,67 @@ def build_msg(sigs):
     return "\n".join(lines)
 
 
+def _tg_token():
+    return MEME_TG_TOKEN or ALT_TG_TOKEN or os.environ.get("TG_TOKEN", "")
+
+
 def send_tg(text):
-    token = ALT_TG_TOKEN if ALT_TG_TOKEN else os.environ.get("TG_TOKEN", "")
+    token = _tg_token()
     if not token:
         print("⚠️ 没配 token"); return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = json.dumps({"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}).encode()
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=10).read()
+
+
+def send_tg_photo(caption, photo_path):
+    token = _tg_token()
+    if not token:
+        print("⚠️ 没配 token"); return
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    boundary = uuid.uuid4().hex
+    with open(photo_path, "rb") as f:
+        photo = f.read()
+
+    def part(name, value, filename=None, content_type=None):
+        head = f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"'
+        if filename: head += f'; filename="{filename}"'
+        head += "\r\n"
+        if content_type: head += f"Content-Type: {content_type}\r\n"
+        head += "\r\n"
+        if isinstance(value, str): value = value.encode()
+        return head.encode() + value + b"\r\n"
+
+    body = b""
+    body += part("chat_id", str(CHAT_ID))
+    body += part("caption", caption)
+    body += part("parse_mode", "Markdown")
+    body += part("photo", photo, filename="chart.png", content_type="image/png")
+    body += f"--{boundary}--\r\n".encode()
+
+    req = urllib.request.Request(url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    urllib.request.urlopen(req, timeout=20).read()
+
+
+def build_single_caption(s):
+    """单币种带图消息文案"""
+    now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    lines = [f"🎯 *{s['symbol']}* · {s['name']}"]
+    lines.append(f"_Robinhood Chain · VWAP × POC 共振_ · {now.strftime('%m-%d %H:%M')} BJ")
+    lines.append("")
+    lines.append(f"💵 现价 `{fmt_price(s['price'])}`")
+    lines.append(f"📊 MCap {fmt_num(s['market_cap'])}  ·  Vol24h {fmt_num(s['vol_24h'])}")
+    lines.append(f"📈 1h {s['change_1h']:+.1f}%  ·  24h {s['change_24h']:+.1f}%")
+    lines.append("")
+    lines.append("🧲 *成本共振区*")
+    lines.append(f"   aVWAP `{fmt_price(s['vwap'])}` ({s['vwap_dist_pct']:+.1f}%)")
+    lines.append(f"   POC   `{fmt_price(s['poc'])}` ({s['poc_dist_pct']:+.1f}%)")
+    lines.append("")
+    lines.append(f"🎯 *$50 试仓 · 翻倍出本*")
+    lines.append(f"🛑 跌破成本区反抽站不回 = 止损")
+    return "\n".join(lines)
 
 
 def main():
@@ -203,22 +362,35 @@ def main():
     sigs.sort(key=lambda s: abs(s["vwap_dist_pct"]) + abs(s["poc_dist_pct"]))
     sigs = sigs[:6]
 
-    # 30 分钟去重
+    # 单币种 30 分钟去重（避免同币重复推）
     state = _load_state()
     now = datetime.datetime.utcnow()
     slot = now.hour * 2 + now.minute // 30
-    key = f"meme_scan:{today_key()}:{slot}"
-    if already_fired(state, key):
-        print("30 min 内已推过"); return
-    mark_fired(state, key)
-    _save_state(state)
+    dk = today_key()
 
-    text = build_msg(sigs)
-    try:
-        send_tg(text)
-        print(f"✓ 推送 {len(sigs)} 个买点")
-    except Exception as e:
-        print(f"推送失败: {e}")
+    pushed = 0
+    for s in sigs:
+        key = f"meme:{s['symbol']}:{dk}:{slot}"
+        if already_fired(state, key):
+            continue
+        mark_fired(state, key)
+        caption = build_single_caption(s)
+        try:
+            png = draw_chart(s)
+            send_tg_photo(caption, png)
+            try: os.remove(png)
+            except: pass
+            pushed += 1
+        except Exception as e:
+            print(f"[push:{s['symbol']}] {e}")
+            try:
+                send_tg(caption)
+                pushed += 1
+            except Exception as e2:
+                print(f"[push text:{s['symbol']}] {e2}")
+
+    _save_state(state)
+    print(f"✓ 推送 {pushed}/{len(sigs)} 个买点")
 
 
 if __name__ == "__main__":

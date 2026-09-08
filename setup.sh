@@ -34,6 +34,7 @@ export PUSHPLUS_TOKEN="${PUSHPLUS_TOKEN:-}"
 export BARK_KEY="${BARK_KEY:-}"
 export FEISHU_WEBHOOK="${FEISHU_WEBHOOK:-}"
 export ALT_TG_TOKEN="${ALT_TG_TOKEN:-}"
+export MEME_TG_TOKEN="${MEME_TG_TOKEN:-}"
 EOF
 chmod 600 "$REPO_DIR/.env"
 
