@@ -1177,6 +1177,13 @@ def main():
             except Exception as e:
                 print(f"[pattern:{symbol}:{tf}] {e}")
 
+    # 8. 震荡切换提醒：4H 收盘后从趋势进入震荡 / 震荡结束，单独推一条
+    for symbol in ALL_SYMBOLS:
+        try:
+            check_regime_switch(symbol, state)
+        except Exception as e:
+            print(f"[regime:{symbol}] {e}")
+
     # 保存去重状态
     _save_state(state)
 
@@ -1401,6 +1408,29 @@ def main():
             push_all(f"🔔 *交易信号*\n\n{caption}")
 
     print(f"Sent: {len(alerts)} level/vol + {len(channel_alerts)} channel + {len(ema_alerts)} ema + {len(retest_alerts)} retest alerts")
+
+
+def check_regime_switch(symbol, state):
+    """比较最近两根已收盘 4H 的行情状态，进入/离开震荡时推送（每根 K 线只推一次）"""
+    import regime
+    k = klines(symbol, "4h", 170)[:-1]
+    now_r = regime.classify(k)
+    states = regime.chop_states(k)
+    was_chop, is_chop = states[-2], states[-1]
+    if was_chop == is_chop:
+        return
+    key = f"regime:{symbol}:{k[-1][6] // 1000}"
+    if already_fired(state, key):
+        return
+    mark_fired(state, key)
+    now_r["tf"] = "4h"
+    if is_chop:
+        push_all(f"🟡 *{symbol}* 4H 进入震荡行情\n\n{regime.warning_text(now_r)}\n\n"
+                 f"提醒自己：震荡里亏钱最多的是 追突破 + 区间中间开单")
+    else:
+        push_all(f"{regime.icon(now_r['regime'])} *{symbol}* 4H 震荡结束 → {now_r['regime']}\n"
+                 f"均线方向：{now_r['trend_dir']}  ADX {now_r['adx']:.0f}  效率比 {now_r['er']:.2f}\n"
+                 f"还是要等结构+价格行为确认再进")
 
 
 def _compute_ema(values, period):
@@ -1636,6 +1666,16 @@ def _push_opportunity(sym, direction, board, market_context, stamp, chart_mod):
     # ===== 组装消息 =====
     lines = [f"{tier_icon} **{sym}** · {dir_icon} **{dir_zh}** · 共振 {score} 分（{tier_zh}）"]
     lines.append("")
+
+    # === 震荡警告（放最前面，先看到）===
+    try:
+        import regime
+        warn = regime.warning_text(regime.get_regime(sym, "4h"), direction)
+        if warn:
+            lines.append(warn)
+            lines.append("")
+    except Exception as e:
+        print(f"[regime:{sym}] {e}")
 
     # === 完整逻辑故事 ===
     narrative = _build_narrative(sym, direction, hits)
