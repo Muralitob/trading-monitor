@@ -1183,6 +1183,11 @@ def main():
             check_regime_switch(symbol, state)
         except Exception as e:
             print(f"[regime:{symbol}] {e}")
+    # 大盘：BTC 日线进入/离开震荡（每天 08:00 BJ 日线收盘后判断）
+    try:
+        check_regime_switch("BTCUSDT", state, tf="1d")
+    except Exception as e:
+        print(f"[regime:BTCUSDT:1d] {e}")
 
     # 保存去重状态
     _save_state(state)
@@ -1410,25 +1415,28 @@ def main():
     print(f"Sent: {len(alerts)} level/vol + {len(channel_alerts)} channel + {len(ema_alerts)} ema + {len(retest_alerts)} retest alerts")
 
 
-def check_regime_switch(symbol, state):
-    """比较最近两根已收盘 4H 的行情状态，进入/离开震荡时推送（每根 K 线只推一次）"""
+def check_regime_switch(symbol, state, tf="4h"):
+    """比较最近两根已收盘 K 线的行情状态，进入/离开震荡时推送（每根 K 线只推一次）"""
     import regime
-    k = klines(symbol, "4h", 170)[:-1]
+    k = klines(symbol, tf, 170)[:-1]
     now_r = regime.classify(k)
     states = regime.chop_states(k)
     was_chop, is_chop = states[-2], states[-1]
     if was_chop == is_chop:
         return
-    key = f"regime:{symbol}:{k[-1][6] // 1000}"
+    key = f"regime:{symbol}:{tf}:{k[-1][6] // 1000}"
     if already_fired(state, key):
         return
     mark_fired(state, key)
-    now_r["tf"] = "4h"
+    now_r["tf"] = tf
+    TF = tf.upper()
+    head = f"🚨 *大盘* {symbol} 日线" if tf == "1d" else f"*{symbol}* {TF}"
     if is_chop:
-        push_all(f"🟡 *{symbol}* 4H 进入震荡行情\n\n{regime.warning_text(now_r)}\n\n"
-                 f"提醒自己：震荡里亏钱最多的是 追突破 + 区间中间开单")
+        tail = ("大盘震荡：今天少做，只做最清楚的结构，别追突破" if tf == "1d"
+                else "提醒自己：震荡里亏钱最多的是 追突破 + 区间中间开单")
+        push_all(f"🟡 {head} 进入震荡行情\n\n{regime.warning_text(now_r)}\n\n{tail}")
     else:
-        push_all(f"{regime.icon(now_r['regime'])} *{symbol}* 4H 震荡结束 → {now_r['regime']}\n"
+        push_all(f"{regime.icon(now_r['regime'])} {head} 震荡结束 → {now_r['regime']}\n"
                  f"均线方向：{now_r['trend_dir']}  ADX {now_r['adx']:.0f}  效率比 {now_r['er']:.2f}\n"
                  f"还是要等结构+价格行为确认再进")
 

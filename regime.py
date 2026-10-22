@@ -184,7 +184,8 @@ def warning_text(r, direction=None):
     lines = [f"{icon(r['regime'])} **⚠️ 注意：{tf} {r['regime']}行情**（{r['votes']}/4 票）"]
     for reason in r["reasons"]:
         lines.append(f"  · {reason}")
-    lines.append(f"  区间 `${r['box_lo']:.4g}` – `${r['box_hi']:.4g}`，现价在{pos_zh(r['pos'])}（{r['pos']*100:.0f}%）")
+    px = lambda v: f"{v:,.0f}" if v >= 1000 else f"{v:.4g}"   # BTC 这类大数不用科学计数法
+    lines.append(f"  区间 `${px(r['box_lo'])}` – `${px(r['box_hi'])}`，现价在{pos_zh(r['pos'])}（{r['pos']*100:.0f}%）")
     if 0.2 < r["pos"] < 0.8:
         lines.append("  👉 区间中部不开单：上下都是噪音，止损容易被来回扫")
     elif direction == "LONG" and r["pos"] >= 0.8:

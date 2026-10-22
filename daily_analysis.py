@@ -302,6 +302,26 @@ def send_feishu_card(card):
     print(f"飞书响应: {resp}")
 
 
+def market_status_lines():
+    """大盘状态（BTC 日线 + 4H 震荡判断），放在预案最前面"""
+    import regime
+    try:
+        d1, h4 = regime.get_regime("BTCUSDT", "1d"), regime.get_regime("BTCUSDT", "4h")
+    except Exception as e:
+        print(f"[大盘] {e}")
+        return []
+    lines = [f"🧭 *大盘 BTC*  日线 {regime.icon(d1['regime'])}{d1['regime']}（方向{d1['trend_dir']}）"
+             f" · 4H {regime.icon(h4['regime'])}{h4['regime']}（方向{h4['trend_dir']}）"]
+    if d1["regime"] == regime.CHOP:
+        lines.append(f"   ⚠️ 日线震荡：区间 {fmt(d1['box_lo'])}–{fmt(d1['box_hi'])}，现价在{regime.pos_zh(d1['pos'])}"
+                     f"，今天少做，别追突破")
+    elif h4["regime"] == regime.CHOP:
+        lines.append(f"   ⚠️ 4H 震荡：区间 {fmt(h4['box_lo'])}–{fmt(h4['box_hi'])}，现价在{regime.pos_zh(h4['pos'])}"
+                     f"，区间中部不开单")
+    lines.append("")
+    return lines
+
+
 def build_telegram_text(symbols_data):
     """把预案转成 Telegram Markdown 文本（无卡片，纯文字）"""
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
@@ -315,6 +335,7 @@ def build_telegram_text(symbols_data):
     lines.append("")
     lines.append(f"扫描 *{len(symbols_data)}* 个标的，{enabled_count} 启用，{triggered_count} 已触发")
     lines.append("")
+    lines += market_status_lines()
 
     # 按状态排序
     order = {"启用": 0, "已触发": 1, "观察": 2, "停用": 3}
