@@ -336,6 +336,9 @@ def build_single_caption(s):
 
 
 def main():
+    # 2026-10-28 停用：用户只要追龙频道，不要链上 MEME 推送（VPS cron 还在，跑到这里直接退出）
+    if not os.environ.get("MEME_ENABLED"):
+        print("meme monitor 已停用"); return
     memes = get_top_memes()
     if not memes:
         print("拉不到 memes 列表"); return
