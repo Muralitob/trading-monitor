@@ -8,3 +8,4 @@ state.json
 # 用户交易分析（含敏感 API 数据）
 analyze_trades.py
 trades_dump/
+dragon_state.json
